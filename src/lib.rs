@@ -12,10 +12,48 @@ mod namespace;
 mod tap;
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+
+/// Configuration for the TAP interface.
+#[derive(Clone, Debug)]
+pub struct TapConfig {
+    /// Name of the TAP interface (default: "tap0")
+    pub interface_name: String,
+    /// Optional IPv4 address and prefix length to configure on the interface
+    pub address: Option<(Ipv4Addr, u8)>,
+}
+
+impl Default for TapConfig {
+    fn default() -> Self {
+        Self {
+            interface_name: "tap0".to_string(),
+            address: None,
+        }
+    }
+}
+
+impl TapConfig {
+    /// Create a new configuration with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the interface name.
+    pub fn interface_name(mut self, name: impl Into<String>) -> Self {
+        self.interface_name = name.into();
+        self
+    }
+
+    /// Set the IPv4 address and prefix length for the interface.
+    pub fn address(mut self, addr: Ipv4Addr, prefix_len: u8) -> Self {
+        self.address = Some((addr, prefix_len));
+        self
+    }
+}
 
 /// A tunnel to a network namespace via a TAP interface.
 ///
@@ -29,13 +67,22 @@ pub struct TapTunnel {
 }
 
 impl TapTunnel {
-    /// Connect to the network namespace of the given PID.
+    /// Connect to the network namespace of the given PID with default configuration.
+    ///
+    /// This is equivalent to `connect_with_config(pid, TapConfig::default())`.
+    pub async fn connect(pid: u32) -> io::Result<Self> {
+        Self::connect_with_config(pid, TapConfig::default()).await
+    }
+
+    /// Connect to the network namespace of the given PID with custom configuration.
     ///
     /// This forks a child process that:
     /// 1. Joins the target's user namespace (gaining capabilities)
     /// 2. Joins the target's network namespace
-    /// 3. Creates a TAP interface named "tap0"
-    /// 4. Relays packets between the TAP and this process
+    /// 3. Creates a TAP interface with the configured name
+    /// 4. Optionally configures an IP address on the interface
+    /// 5. Brings the interface up
+    /// 6. Relays packets between the TAP and this process
     ///
     /// # Errors
     ///
@@ -43,7 +90,7 @@ impl TapTunnel {
     /// - The target PID doesn't exist or its namespaces can't be accessed
     /// - The fork fails
     /// - The socketpair creation fails
-    pub async fn connect(pid: u32) -> io::Result<Self> {
+    pub async fn connect_with_config(pid: u32, config: TapConfig) -> io::Result<Self> {
         // Create socketpair for parent-child communication
         let (parent_fd, child_fd) = ipc::create_socketpair()?;
 
@@ -52,7 +99,7 @@ impl TapTunnel {
             Ok(nix::unistd::ForkResult::Child) => {
                 // Child process: close parent's end and run the relay loop
                 drop(parent_fd);
-                child::run_child(pid, child_fd);
+                child::run_child(pid, child_fd, config);
                 // run_child never returns
             }
             Ok(nix::unistd::ForkResult::Parent { child }) => {

@@ -26,3 +26,7 @@ pub fn create_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
 
     Ok((parent_fd, child_fd))
 }
+
+// TODO: add some unit tests
+//  - send a couple small frames
+//  - recv and verify that packets are received frame by frame

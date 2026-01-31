@@ -1,37 +1,117 @@
 //! # tap-tunnel
 //!
-//! A Rust library providing an async tokio API to send/receive IP packets
-//! to/from a network namespace via a TAP interface.
+//! A Rust library providing an async tokio API to create TCP/UDP sockets
+//! within a network namespace via a userspace TCP/IP stack (smoltcp).
 //!
 //! This library requires no special capabilities - it leverages the target
 //! process's user namespace to gain the necessary permissions.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────┐
+//! │                    Client Process                       │
+//! │  ┌──────────────────────────────────────────────────┐   │
+//! │  │              User Code (async)                   │   │
+//! │  │   TcpStream::connect(), stream.read/write()      │   │
+//! │  └──────────────────┬───────────────────────────────┘   │
+//! │                     │ channels                          │
+//! │  ┌──────────────────▼───────────────────────────────┐   │
+//! │  │         smoltcp Stack Thread (blocking)          │   │
+//! │  │   Interface + Sockets + poll() loop              │   │
+//! │  └──────────────────┬───────────────────────────────┘   │
+//! │                     │ ProxyDevice (impl Device)         │
+//! │  ┌──────────────────▼───────────────────────────────┐   │
+//! │  │              IPC (Unix socket)                   │   │
+//! │  └──────────────────┬───────────────────────────────┘   │
+//! └─────────────────────┼───────────────────────────────────┘
+//!                       │ Ethernet frames
+//! ┌─────────────────────▼───────────────────────────────────┐
+//! │                  TAP Proxy Process                      │
+//! │          TAP device ←→ Frame relay ←→ IPC               │
+//! └─────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Usage
+//!
+//! ```no_run
+//! use tap_tunnel::{TapConfig, Tunnel};
+//! use std::net::Ipv4Addr;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Connect to the network namespace of PID 1234
+//! // - peer_addr: IP for the TAP interface in the namespace (server side)
+//! // - local_addr: IP for the smoltcp stack (client side)
+//! let config = TapConfig::new()
+//!     .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24)
+//!     .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24);
+//! let tunnel = Tunnel::connect_with_config(1234, config).await?;
+//!
+//! // Create a TCP connection to a server in the namespace
+//! let mut stream = tunnel.tcp_connect("10.0.0.1:8080".parse()?).await?;
+//! stream.write_all(b"Hello!").await?;
+//!
+//! let mut buf = [0u8; 1024];
+//! let n = stream.read(&mut buf).await?;
+//! # Ok(())
+//! # }
+//! ```
 
-mod child;
 mod ipc;
-mod namespace;
-mod tap;
+pub mod namespace;
+pub mod proxy;
+pub mod socket;
+mod stack;
+pub(crate) mod tap;
 
+use crossbeam_channel::{Sender, bounded};
+use log::debug;
+use smoltcp::phy::FaultInjector;
+use socket::{TcpStream, UdpSocket};
+use stack::{ProxyDevice, StackCommand, StackConfig};
 use std::io;
-use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::net::{Ipv4Addr, SocketAddr};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use tokio::io::unix::AsyncFd;
-use tokio::io::Interest;
+use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
-/// Configuration for the TAP interface.
+pub use socket::{TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket};
+
+/// Configuration for the TAP tunnel.
+///
+/// The tunnel creates a point-to-point link between the smoltcp stack (client side)
+/// and the TAP interface (namespace side):
+///
+/// ```text
+/// Client Process              │  Target Namespace
+/// ────────────────────────────┼───────────────────────
+/// smoltcp stack               │  TAP interface
+/// local_addr (e.g. 10.0.0.2)  │  peer_addr (e.g. 10.0.0.1)
+/// ```
 #[derive(Clone, Debug)]
 pub struct TapConfig {
     /// Name of the TAP interface (default: "tap0")
     pub interface_name: String,
-    /// Optional IPv4 address and prefix length to configure on the interface
-    pub address: Option<(Ipv4Addr, u8)>,
+    /// IPv4 address for the TAP interface in the namespace (peer side)
+    pub peer_addr: Option<(Ipv4Addr, u8)>,
+    /// IPv4 address for the smoltcp stack (local/client side)
+    pub local_addr: Option<(Ipv4Addr, u8)>,
+    /// MAC address for the smoltcp stack (default: auto-generated)
+    pub mac: Option<[u8; 6]>,
+    /// Packet loss percentage for testing (0-100, default: 0)
+    pub packet_loss_percent: u8,
 }
 
 impl Default for TapConfig {
     fn default() -> Self {
         Self {
             interface_name: "tap0".to_string(),
-            address: None,
+            peer_addr: None,
+            local_addr: None,
+            mac: None,
+            packet_loss_percent: 0,
         }
     }
 }
@@ -48,147 +128,382 @@ impl TapConfig {
         self
     }
 
-    /// Set the IPv4 address and prefix length for the interface.
-    pub fn address(mut self, addr: Ipv4Addr, prefix_len: u8) -> Self {
-        self.address = Some((addr, prefix_len));
+    /// Set the IPv4 address for the TAP interface in the namespace.
+    /// This is the address that servers in the namespace should listen on.
+    pub fn peer_addr(mut self, addr: Ipv4Addr, prefix_len: u8) -> Self {
+        self.peer_addr = Some((addr, prefix_len));
+        self
+    }
+
+    /// Set the IPv4 address for the smoltcp stack (client side).
+    /// This is the source address used when connecting to servers.
+    pub fn local_addr(mut self, addr: Ipv4Addr, prefix_len: u8) -> Self {
+        self.local_addr = Some((addr, prefix_len));
+        self
+    }
+
+    /// Set the MAC address for the smoltcp stack.
+    pub fn mac(mut self, mac: [u8; 6]) -> Self {
+        self.mac = Some(mac);
+        self
+    }
+
+    /// Set the packet loss percentage for testing (0-100).
+    /// Uses smoltcp's FaultInjector to simulate lossy networks.
+    pub fn packet_loss_percent(mut self, percent: u8) -> Self {
+        self.packet_loss_percent = percent;
         self
     }
 }
 
-/// A tunnel to a network namespace via a TAP interface.
+/// A tunnel to a network namespace providing socket access via smoltcp.
 ///
-/// The tunnel is established by forking a child process that joins the
-/// target namespace, creates a TAP interface, and relays packets between
-/// the TAP device and this process via a Unix socket.
-pub struct TapTunnel {
-    socket: AsyncFd<UnixStream>,
-    #[allow(dead_code)]
-    child_pid: u32,
+/// The tunnel is established by:
+/// 1. Spawning a TAP proxy process that joins the target namespace
+/// 2. Running a smoltcp stack thread that handles protocol processing
+///
+/// This type is cloneable and can be shared between tasks.
+pub struct Tunnel {
+    inner: Arc<TunnelInner>,
 }
 
-impl TapTunnel {
+struct TunnelInner {
+    /// Channel to send commands to the stack thread
+    commands: Sender<StackCommand>,
+    /// TAP proxy child process
+    proxy_child: Mutex<Child>,
+    /// Stack thread handle
+    stack_thread: Mutex<Option<JoinHandle<()>>>,
+    /// IPC reader thread handle
+    ipc_reader_thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for TunnelInner {
+    fn drop(&mut self) {
+        // Signal stack to shutdown
+        let _ = self.commands.send(StackCommand::Shutdown);
+
+        // Wait for stack thread
+        if let Ok(mut handle) = self.stack_thread.lock()
+            && let Some(h) = handle.take()
+        {
+            let _ = h.join();
+        }
+
+        // Wait for IPC reader thread
+        if let Ok(mut handle) = self.ipc_reader_thread.lock()
+            && let Some(h) = handle.take()
+        {
+            let _ = h.join();
+        }
+
+        // Clean up proxy process
+        if let Ok(mut child) = self.proxy_child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Find the proxy binary path.
+fn find_proxy_binary() -> io::Result<std::path::PathBuf> {
+    const PROXY_NAME: &str = "tap-tunnel-proxy";
+
+    // 1. Check same directory as current executable
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        let proxy_path = exe_dir.join(PROXY_NAME);
+        if proxy_path.exists() {
+            return Ok(proxy_path);
+        }
+
+        // Also check parent directories for cargo target structure
+        if let Some(parent) = exe_dir.parent() {
+            let proxy_path = parent.join(PROXY_NAME);
+            if proxy_path.exists() {
+                return Ok(proxy_path);
+            }
+        }
+    }
+
+    // 2. Check TAP_TUNNEL_PROXY environment variable
+    if let Ok(proxy_path) = std::env::var("TAP_TUNNEL_PROXY") {
+        let path = std::path::PathBuf::from(&proxy_path);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // 3. Check CARGO_MANIFEST_DIR for development builds
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        let target_debug = std::path::PathBuf::from(&manifest_dir)
+            .join("target")
+            .join("debug")
+            .join(PROXY_NAME);
+        if target_debug.exists() {
+            return Ok(target_debug);
+        }
+
+        let target_release = std::path::PathBuf::from(&manifest_dir)
+            .join("target")
+            .join("release")
+            .join(PROXY_NAME);
+        if target_release.exists() {
+            return Ok(target_release);
+        }
+    }
+
+    // 4. Check system PATH using `which`
+    let output = std::process::Command::new("which").arg(PROXY_NAME).output();
+
+    if let Ok(output) = output
+        && output.status.success()
+    {
+        let path_str = String::from_utf8_lossy(&output.stdout);
+        let path = std::path::PathBuf::from(path_str.trim());
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "proxy binary '{}' not found. Ensure it's in the same directory as the executable, \
+             set TAP_TUNNEL_PROXY environment variable, or install it in PATH",
+            PROXY_NAME
+        ),
+    ))
+}
+
+/// Remove the CLOEXEC flag from a file descriptor so it's inherited across exec.
+fn remove_cloexec(fd: &OwnedFd) -> io::Result<()> {
+    let raw_fd = fd.as_raw_fd();
+    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let new_flags = flags & !libc::FD_CLOEXEC;
+    let ret = unsafe { libc::fcntl(raw_fd, libc::F_SETFD, new_flags) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Spawn the proxy binary.
+fn spawn_proxy(pid: u32, frame_fd: OwnedFd, config: &TapConfig) -> io::Result<Child> {
+    remove_cloexec(&frame_fd)?;
+
+    let proxy_path = find_proxy_binary()?;
+    let frame_fd_num = frame_fd.as_raw_fd();
+
+    let mut cmd = Command::new(&proxy_path);
+    cmd.arg("--pid").arg(pid.to_string());
+    cmd.arg("--frame-fd").arg(frame_fd_num.to_string());
+    cmd.arg("--tap-name").arg(&config.interface_name);
+
+    // Configure the TAP interface with the peer address
+    if let Some((ip, prefix)) = config.peer_addr {
+        cmd.arg("--tap-addr").arg(format!("{}/{}", ip, prefix));
+    }
+
+    let child = cmd.spawn().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "failed to spawn proxy binary '{}': {}",
+                proxy_path.display(),
+                e
+            ),
+        )
+    })?;
+
+    // Prevent the FD from being closed - proxy now owns it
+    std::mem::forget(frame_fd);
+
+    Ok(child)
+}
+
+/// Convert an OwnedFd to a UnixStream.
+fn fd_to_unix_stream(fd: OwnedFd) -> io::Result<UnixStream> {
+    let raw_fd = fd.into_raw_fd();
+    let stream = unsafe { UnixStream::from_raw_fd(raw_fd) };
+    Ok(stream)
+}
+
+impl Tunnel {
     /// Connect to the network namespace of the given PID with default configuration.
-    ///
-    /// This is equivalent to `connect_with_config(pid, TapConfig::default())`.
     pub async fn connect(pid: u32) -> io::Result<Self> {
         Self::connect_with_config(pid, TapConfig::default()).await
     }
 
     /// Connect to the network namespace of the given PID with custom configuration.
     ///
-    /// This forks a child process that:
-    /// 1. Joins the target's user namespace (gaining capabilities)
-    /// 2. Joins the target's network namespace
-    /// 3. Creates a TAP interface with the configured name
-    /// 4. Optionally configures an IP address on the interface
-    /// 5. Brings the interface up
-    /// 6. Relays packets between the TAP and this process
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The target PID doesn't exist or its namespaces can't be accessed
-    /// - The fork fails
-    /// - The socketpair creation fails
+    /// This spawns a TAP proxy process and starts a smoltcp stack thread.
     pub async fn connect_with_config(pid: u32, config: TapConfig) -> io::Result<Self> {
-        // Create socketpair for parent-child communication
+        Self::connect_with_config_blocking(pid, config)
+    }
+
+    /// Synchronous version of connect_with_config.
+    pub fn connect_with_config_blocking(pid: u32, config: TapConfig) -> io::Result<Self> {
+        // Create socketpair for frame relay (SEQPACKET for message boundaries)
         let (parent_fd, child_fd) = ipc::create_socketpair()?;
 
-        // Fork the child process
-        match unsafe { nix::unistd::fork() } {
-            Ok(nix::unistd::ForkResult::Child) => {
-                // Child process: close parent's end and run the relay loop
-                drop(parent_fd);
-                child::run_child(pid, child_fd, config);
-                // run_child never returns
+        // Spawn the proxy process
+        let proxy_child = spawn_proxy(pid, child_fd, &config)?;
+
+        // Set up channels for stack communication
+        let (cmd_tx, cmd_rx) = bounded::<StackCommand>(256);
+        let (frame_tx, frame_rx) = bounded::<Vec<u8>>(256);
+        let (frame_to_proxy_tx, frame_to_proxy_rx) = bounded::<Vec<u8>>(256);
+
+        // Convert parent FD to blocking UnixStream for IPC
+        let ipc_stream = fd_to_unix_stream(parent_fd)?;
+        ipc_stream.set_nonblocking(false)?;
+
+        // Generate MAC address
+        let mac = config.mac.unwrap_or_else(|| {
+            // Generate a locally administered unicast MAC
+            let mut mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+            mac[5] = (pid & 0xff) as u8;
+            mac
+        });
+
+        // Get IP configuration for smoltcp stack (local/client side)
+        let (local_ip, local_prefix) = config.local_addr.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "local_addr must be configured")
+        })?;
+
+        // Gateway is the peer address (TAP interface in namespace)
+        let gateway = config.peer_addr.map(|(ip, _)| ip);
+
+        let stack_config = StackConfig {
+            mac,
+            ip: local_ip,
+            prefix_len: local_prefix,
+            gateway,
+        };
+
+        // Clone for IPC threads
+        let ipc_read_stream = ipc_stream.try_clone()?;
+        let ipc_write_stream = ipc_stream;
+
+        // Spawn IPC reader thread (proxy -> stack)
+        let ipc_reader_thread = std::thread::spawn(move || {
+            debug!("[IPC-RX] reader thread starting");
+            let mut buf = [0u8; 1522]; // TODO: constant
+            loop {
+                use std::io::Read;
+                match (&ipc_read_stream).read(&mut buf) {
+                    Ok(0) => {
+                        debug!("[IPC-RX] proxy closed connection");
+                        break;
+                    }
+                    Ok(n) => {
+                        debug!("[IPC-RX] read {} bytes, sending to stack", n);
+                        if frame_tx.send(buf[..n].to_vec()).is_err() {
+                            debug!("[IPC-RX] stack channel closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("[IPC-RX] error: {}", e);
+                        break;
+                    }
+                }
             }
-            Ok(nix::unistd::ForkResult::Parent { child }) => {
-                // Parent process: close child's end
-                drop(child_fd);
+            debug!("[IPC-RX] reader thread exiting");
+        });
 
-                // Convert OwnedFd to UnixStream for AsyncFd
-                let stream = fd_to_unix_stream(parent_fd)?;
-
-                // Set non-blocking for async operation
-                stream.set_nonblocking(true)?;
-
-                let socket = AsyncFd::new(stream)?;
-
-                Ok(TapTunnel {
-                    socket,
-                    child_pid: child.as_raw() as u32,
-                })
+        // Spawn IPC writer thread (stack -> proxy)
+        std::thread::spawn(move || {
+            use std::io::Write;
+            debug!("[IPC-TX] writer thread starting");
+            loop {
+                match frame_to_proxy_rx.recv() {
+                    Ok(frame) => {
+                        debug!("[IPC-TX] sending {} bytes to proxy", frame.len());
+                        if let Err(e) = (&ipc_write_stream).write_all(&frame) {
+                            debug!("[IPC-TX] write error: {}", e);
+                            break;
+                        }
+                        debug!("[IPC-TX] sent successfully");
+                    }
+                    Err(_) => {
+                        debug!("[IPC-TX] stack channel closed");
+                        break;
+                    }
+                }
             }
-            Err(e) => Err(io::Error::other(format!("fork failed: {}", e))),
-        }
+            debug!("[IPC-TX] writer thread exiting");
+        });
+
+        // Create device for smoltcp (wrap in FaultInjector for packet loss simulation)
+        let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, 1514);
+        let mut device = FaultInjector::new(device, random_seed());
+        device.set_drop_chance(config.packet_loss_percent);
+
+        // Spawn stack thread
+        let stack_thread = std::thread::spawn(move || {
+            stack::run_stack(&mut device, stack_config, cmd_rx);
+        });
+
+        Ok(Tunnel {
+            inner: Arc::new(TunnelInner {
+                commands: cmd_tx,
+                proxy_child: Mutex::new(proxy_child),
+                stack_thread: Mutex::new(Some(stack_thread)),
+                ipc_reader_thread: Mutex::new(Some(ipc_reader_thread)),
+            }),
+        })
     }
 
-    /// Send an IP packet into the namespace.
-    ///
-    /// The packet should be a raw IP packet (IPv4 or IPv6).
-    /// The child process will add the appropriate Ethernet header
-    /// before writing to the TAP device.
-    pub async fn send(&self, packet: &[u8]) -> io::Result<()> {
-        loop {
-            let mut guard = self.socket.ready(Interest::WRITABLE).await?;
+    /// Create a TCP connection to the given address.
+    pub async fn tcp_connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
 
-            match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let ret = unsafe {
-                    libc::send(fd, packet.as_ptr() as *const libc::c_void, packet.len(), 0)
-                };
-                if ret < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            }) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
-        }
+        self.inner
+            .commands
+            .send(StackCommand::TcpConnect { addr, response: tx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+
+        let handle = rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+
+        Ok(TcpStream::from_handle(handle, self.inner.commands.clone()))
     }
 
-    /// Receive an IP packet from the namespace.
-    ///
-    /// Returns the number of bytes read into the buffer.
-    /// The returned data is a raw IP packet (Ethernet headers stripped).
-    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let mut guard = self.socket.ready(Interest::READABLE).await?;
+    /// Bind a UDP socket to the given address.
+    pub async fn udp_bind(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
 
-            match guard.try_io(|inner| {
-                let fd = inner.get_ref().as_raw_fd();
-                let ret = unsafe {
-                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-                };
-                if ret < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(ret as usize)
-                }
-            }) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
+        self.inner
+            .commands
+            .send(StackCommand::UdpBind { addr, response: tx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+
+        let handle = rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+
+        Ok(UdpSocket::from_handle(handle, self.inner.commands.clone()))
+    }
+}
+
+impl Clone for Tunnel {
+    fn clone(&self) -> Self {
+        Tunnel {
+            inner: Arc::clone(&self.inner),
         }
     }
 }
 
-/// Convert an OwnedFd to a UnixStream.
-fn fd_to_unix_stream(fd: OwnedFd) -> io::Result<UnixStream> {
-    use std::os::fd::FromRawFd;
-    use std::os::fd::IntoRawFd;
-
-    // Safety: we own the fd and are transferring ownership to UnixStream
-    let raw_fd = fd.into_raw_fd();
-    let stream = unsafe { UnixStream::from_raw_fd(raw_fd) };
-    Ok(stream)
-}
-
-impl Drop for TapTunnel {
-    fn drop(&mut self) {
-        // Closing the socket will cause the child to detect EOF and exit.
-        // We don't need to explicitly kill it.
-    }
+fn random_seed() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos()
 }

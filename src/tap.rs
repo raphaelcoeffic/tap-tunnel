@@ -96,7 +96,11 @@ pub fn get_interface_mac(name: &str) -> io::Result<[u8; 6]> {
 }
 
 /// Configure an IPv4 address on a network interface.
-pub fn configure_interface_ip(name: &str, addr: std::net::Ipv4Addr, prefix_len: u8) -> io::Result<()> {
+pub fn configure_interface_ip(
+    name: &str,
+    addr: std::net::Ipv4Addr,
+    prefix_len: u8,
+) -> io::Result<()> {
     #[repr(C)]
     struct IfReqAddr {
         ifr_name: [libc::c_char; libc::IFNAMSIZ],

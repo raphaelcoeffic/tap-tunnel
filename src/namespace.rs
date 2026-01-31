@@ -1,4 +1,4 @@
-use nix::sched::{setns, CloneFlags};
+use nix::sched::{CloneFlags, setns};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsFd;

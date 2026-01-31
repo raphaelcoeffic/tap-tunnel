@@ -1,6 +1,8 @@
 # tap-tunnel
 
-A Rust library for sending and receiving IP packets to/from a network namespace via a TAP interface. No special capabilities required - leverages the target's user namespace.
+A Rust library for sending and receiving IP packets to/from a network namespace
+via a TAP interface. No special capabilities required - leverages the target's
+user namespace.
 
 ## Usage
 
@@ -60,6 +62,13 @@ cargo run --example echo_tunnel <PID>
 
 # Terminal 1: Ping the virtual host
 ping 10.0.0.2  # Should get replies
+```
+
+Enable debug logging with `RUST_LOG`:
+
+```bash
+RUST_LOG=debug cargo run --example echo_tunnel <PID>
+RUST_LOG=trace cargo run --example echo_tunnel <PID>  # very verbose
 ```
 
 ## API

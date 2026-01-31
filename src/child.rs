@@ -1,6 +1,7 @@
 use crate::namespace::join_namespace;
 use crate::tap::{bring_interface_up, configure_interface_ip, create_tap, get_interface_mac};
 use crate::TapConfig;
+use log::{debug, error, trace};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -34,44 +35,32 @@ const ARP_OP_REPLY: u16 = 2;
 /// exits the process on error.
 pub fn run_child(target_pid: u32, socket_fd: OwnedFd, config: TapConfig) -> ! {
     if let Err(e) = run_child_inner(target_pid, socket_fd, config) {
-        eprintln!("tap-tunnel child error: {}", e);
+        error!("child error: {}", e);
         std::process::exit(1);
     }
     std::process::exit(0);
 }
 
 fn run_child_inner(target_pid: u32, socket_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
-    let debug = std::env::var("TAP_TUNNEL_DEBUG").is_ok();
-
-    if debug {
-        eprintln!("[child] starting, target_pid={}", target_pid);
-    }
+    debug!("child starting, target_pid={}", target_pid);
 
     // Join the target's namespaces
     join_namespace(target_pid)?;
-    if debug {
-        eprintln!("[child] joined namespaces");
-    }
+    debug!("joined namespaces");
 
     // Create TAP interface
     let tap_fd = create_tap(&config.interface_name)?;
-    if debug {
-        eprintln!("[child] created TAP interface: {}", config.interface_name);
-    }
+    debug!("created TAP interface: {}", config.interface_name);
 
     // Configure IP address if specified
     if let Some((ip, prefix_len)) = config.address {
         configure_interface_ip(&config.interface_name, ip, prefix_len)?;
-        if debug {
-            eprintln!("[child] configured IP: {}/{}", ip, prefix_len);
-        }
+        debug!("configured IP: {}/{}", ip, prefix_len);
     }
 
     // Bring the interface up so it can receive packets
     bring_interface_up(&config.interface_name)?;
-    if debug {
-        eprintln!("[child] interface {} is up", config.interface_name);
-    }
+    debug!("interface {} is up", config.interface_name);
 
     // Get the TAP's MAC address for constructing Ethernet headers
     let tap_mac =
@@ -85,14 +74,12 @@ fn relay_loop(tap_fd: OwnedFd, socket_fd: OwnedFd, tap_mac: [u8; 6]) -> io::Resu
     let tap_raw = tap_fd.as_raw_fd();
     let socket_raw = socket_fd.as_raw_fd();
 
-    let debug = std::env::var("TAP_TUNNEL_DEBUG").is_ok();
-
     let mut buf = vec![0u8; MAX_PACKET_SIZE + ETH_HEADER_SIZE];
 
-    if debug {
-        eprintln!("[child] relay loop started, tap_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            tap_mac[0], tap_mac[1], tap_mac[2], tap_mac[3], tap_mac[4], tap_mac[5]);
-    }
+    debug!(
+        "relay loop started, tap_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        tap_mac[0], tap_mac[1], tap_mac[2], tap_mac[3], tap_mac[4], tap_mac[5]
+    );
 
     loop {
         let mut poll_fds = [
@@ -118,17 +105,13 @@ fn relay_loop(tap_fd: OwnedFd, socket_fd: OwnedFd, tap_mac: [u8; 6]) -> io::Resu
                     let frame = &buf[..n as usize];
                     let ethertype = ((frame[12] as u16) << 8) | (frame[13] as u16);
 
-                    if debug {
-                        eprintln!("[child] TAP recv: {} bytes, ethertype=0x{:04x}", n, ethertype);
-                    }
+                    trace!("TAP recv: {} bytes, ethertype=0x{:04x}", n, ethertype);
 
                     match ethertype {
                         ETHERTYPE_IPV4 | ETHERTYPE_IPV6 => {
                             // Forward IP packet to parent (strip Ethernet header)
                             let ip_packet = &frame[ETH_HEADER_SIZE..];
-                            if debug {
-                                eprintln!("[child] forwarding IP packet to parent: {} bytes", ip_packet.len());
-                            }
+                            trace!("forwarding IP packet to parent: {} bytes", ip_packet.len());
                             let sent = unsafe {
                                 libc::send(
                                     socket_raw,
@@ -139,25 +122,19 @@ fn relay_loop(tap_fd: OwnedFd, socket_fd: OwnedFd, tap_mac: [u8; 6]) -> io::Resu
                             };
                             if sent < 0 {
                                 let err = io::Error::last_os_error();
-                                if debug {
-                                    eprintln!("[child] send to parent failed: {}", err);
-                                }
+                                debug!("send to parent failed: {}", err);
                                 if err.kind() != io::ErrorKind::WouldBlock {
                                     return Err(err);
                                 }
-                            } else if debug {
-                                eprintln!("[child] sent {} bytes to parent", sent);
+                            } else {
+                                trace!("sent {} bytes to parent", sent);
                             }
                         }
                         ETHERTYPE_ARP => {
-                            if debug {
-                                eprintln!("[child] received ARP frame");
-                            }
+                            trace!("received ARP frame");
                             // Handle ARP locally
                             if let Some(reply) = handle_arp_request(frame, &tap_mac) {
-                                if debug {
-                                    eprintln!("[child] sending ARP reply: {} bytes", reply.len());
-                                }
+                                trace!("sending ARP reply: {} bytes", reply.len());
                                 let written = unsafe {
                                     libc::write(
                                         tap_raw,
@@ -167,23 +144,19 @@ fn relay_loop(tap_fd: OwnedFd, socket_fd: OwnedFd, tap_mac: [u8; 6]) -> io::Resu
                                 };
                                 if written < 0 {
                                     let err = io::Error::last_os_error();
-                                    if debug {
-                                        eprintln!("[child] ARP reply write failed: {}", err);
-                                    }
+                                    debug!("ARP reply write failed: {}", err);
                                     if err.kind() != io::ErrorKind::WouldBlock {
                                         return Err(err);
                                     }
-                                } else if debug {
-                                    eprintln!("[child] ARP reply written: {} bytes", written);
+                                } else {
+                                    trace!("ARP reply written: {} bytes", written);
                                 }
-                            } else if debug {
-                                eprintln!("[child] ARP frame ignored (not a request or invalid)");
+                            } else {
+                                trace!("ARP frame ignored (not a request or invalid)");
                             }
                         }
                         _ => {
-                            if debug {
-                                eprintln!("[child] ignoring frame with ethertype 0x{:04x}", ethertype);
-                            }
+                            trace!("ignoring frame with ethertype 0x{:04x}", ethertype);
                         }
                     }
                 }
@@ -217,14 +190,10 @@ fn relay_loop(tap_fd: OwnedFd, socket_fd: OwnedFd, tap_mac: [u8; 6]) -> io::Resu
                     }
                 } else if n == 0 {
                     // Parent closed the socket, exit cleanly
-                    if debug {
-                        eprintln!("[child] parent closed socket, exiting");
-                    }
+                    debug!("parent closed socket, exiting");
                     return Ok(());
                 } else {
-                    if debug {
-                        eprintln!("[child] received {} bytes from parent", n);
-                    }
+                    trace!("received {} bytes from parent", n);
 
                     // Determine IP version from first byte
                     let ip_version = (buf[ETH_HEADER_SIZE] >> 4) & 0x0F;
@@ -245,22 +214,22 @@ fn relay_loop(tap_fd: OwnedFd, socket_fd: OwnedFd, tap_mac: [u8; 6]) -> io::Resu
 
                     // Write frame to TAP
                     let frame_len = ETH_HEADER_SIZE + n as usize;
-                    if debug {
-                        eprintln!("[child] writing {} byte frame to TAP (ethertype=0x{:04x})", frame_len, ethertype);
-                    }
+                    trace!(
+                        "writing {} byte frame to TAP (ethertype=0x{:04x})",
+                        frame_len,
+                        ethertype
+                    );
                     let written = unsafe {
                         libc::write(tap_raw, buf.as_ptr() as *const libc::c_void, frame_len)
                     };
                     if written < 0 {
                         let err = io::Error::last_os_error();
-                        if debug {
-                            eprintln!("[child] TAP write failed: {}", err);
-                        }
+                        debug!("TAP write failed: {}", err);
                         if err.kind() != io::ErrorKind::WouldBlock {
                             return Err(err);
                         }
-                    } else if debug {
-                        eprintln!("[child] wrote {} bytes to TAP", written);
+                    } else {
+                        trace!("wrote {} bytes to TAP", written);
                     }
                 }
             }

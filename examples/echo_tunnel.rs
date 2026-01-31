@@ -17,13 +17,22 @@
 //!
 //!   # Terminal 1: Ping the virtual host
 //!   ping 10.0.0.2  # Should get replies
+//!
+//! Enable debug logging with:
+//!   RUST_LOG=debug cargo run --example echo_tunnel <PID>
+//!
+//! Or for trace-level (very verbose):
+//!   RUST_LOG=trace cargo run --example echo_tunnel <PID>
 
+use log::{debug, info, trace};
 use std::env;
 use std::net::Ipv4Addr;
 use tap_tunnel::{TapConfig, TapTunnel};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: {} <PID>", args[0]);
@@ -32,17 +41,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pid: u32 = args[1].parse().map_err(|_| "Invalid PID")?;
 
-    println!("Connecting to namespace of PID {}...", pid);
+    info!("Connecting to namespace of PID {}...", pid);
 
     // Configure 10.0.0.1/24 on tap0 - this is the namespace's address.
     // The library "pretends" to be 10.0.0.2 by responding to ARP/ICMP.
     let config = TapConfig::new().address(Ipv4Addr::new(10, 0, 0, 1), 24);
     let tunnel = TapTunnel::connect_with_config(pid, config).await?;
-    println!("Connected! TAP interface configured with 10.0.0.1/24");
-    println!("In the namespace, run: ping 10.0.0.2");
-    println!("Waiting for ICMP echo requests...");
+    info!("Connected! TAP interface configured with 10.0.0.1/24");
+    info!("In the namespace, run: ping 10.0.0.2");
+    info!("Waiting for ICMP echo requests...");
 
-    let debug = std::env::var("TAP_TUNNEL_DEBUG").is_ok();
     let mut buf = vec![0u8; 65535];
 
     loop {
@@ -53,30 +61,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let packet = &buf[..n];
 
-        if debug {
-            eprintln!("[parent] received {} byte packet", n);
-            if n >= 20 {
-                let version = (packet[0] >> 4) & 0x0F;
-                let protocol = packet[9];
-                eprintln!("[parent] IP version={}, protocol={}", version, protocol);
-            }
+        trace!("received {} byte packet", n);
+        if n >= 20 {
+            let version = (packet[0] >> 4) & 0x0F;
+            let protocol = packet[9];
+            trace!("IP version={}, protocol={}", version, protocol);
         }
 
         // Check if this is an IPv4 ICMP echo request
         if let Some(reply) = process_icmp_echo_request(packet) {
-            println!(
-                "Received ping from {}, sending reply",
-                format_ipv4_src(packet)
-            );
-            if debug {
-                eprintln!("[parent] sending {} byte reply", reply.len());
-            }
+            info!("Received ping from {}, sending reply", format_ipv4_src(packet));
+            debug!("sending {} byte reply", reply.len());
             tunnel.send(&reply).await?;
-            if debug {
-                eprintln!("[parent] reply sent");
-            }
-        } else if debug {
-            eprintln!("[parent] packet is not an ICMP echo request, ignoring");
+            trace!("reply sent");
+        } else {
+            trace!("packet is not an ICMP echo request, ignoring");
         }
     }
 

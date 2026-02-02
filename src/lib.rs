@@ -64,7 +64,7 @@ mod stack;
 use crossbeam_channel::{Sender, bounded};
 use log::debug;
 use smoltcp::phy::FaultInjector;
-use socket::{TcpStream, UdpSocket};
+use socket::{TcpListener, TcpStream, UdpSocket};
 use stack::{ProxyDevice, StackCommand, StackConfig};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -75,7 +75,7 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-pub use socket::{TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket};
+pub use socket::{TcpListener as TunnelTcpListener, TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket};
 
 /// Configuration for the TAP tunnel.
 ///
@@ -533,6 +533,66 @@ impl Tunnel {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
 
         Ok(TcpStream::from_handle(handle, self.inner.commands.clone()))
+    }
+
+    /// Create a TCP listener bound to the given address.
+    ///
+    /// The listener will accept incoming connections from the network namespace.
+    /// Use `accept()` to accept connections.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use tap_tunnel::{TapConfig, Tunnel};
+    /// use std::net::Ipv4Addr;
+    ///
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = TapConfig::new()
+    ///     .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24)
+    ///     .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24);
+    /// let tunnel = Tunnel::connect_with_config(1234, config).await?;
+    ///
+    /// // Listen on the smoltcp stack's address
+    /// let listener = tunnel.tcp_listen("10.0.0.2:8080".parse()?).await?;
+    ///
+    /// // Accept connections from the namespace
+    /// let (stream, peer_addr) = listener.accept().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn tcp_listen(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+        self.tcp_listen_with_backlog(addr, 16).await
+    }
+
+    /// Create a TCP listener with a specified backlog.
+    ///
+    /// The backlog determines how many pending connections can be queued
+    /// before new connections are refused.
+    pub async fn tcp_listen_with_backlog(
+        &self,
+        addr: SocketAddr,
+        backlog: usize,
+    ) -> io::Result<TcpListener> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.inner
+            .commands
+            .send(StackCommand::TcpListen {
+                addr,
+                backlog,
+                response: tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+
+        let (handle, local_addr) = rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+
+        Ok(TcpListener::from_handle(
+            handle,
+            local_addr,
+            self.inner.commands.clone(),
+        ))
     }
 
     /// Bind a UDP socket to the given address.

@@ -160,3 +160,69 @@ impl Drop for UdpSocket {
         self.close();
     }
 }
+
+/// A TCP listener that accepts incoming connections.
+///
+/// This provides an async accept interface similar to `tokio::net::TcpListener`,
+/// but backed by smoltcp running in a dedicated thread.
+pub struct TcpListener {
+    handle: SocketHandle,
+    local_addr: SocketAddr,
+    commands: Sender<StackCommand>,
+}
+
+impl TcpListener {
+    /// Create a TcpListener from an existing socket handle.
+    pub(crate) fn from_handle(
+        handle: SocketHandle,
+        local_addr: SocketAddr,
+        commands: Sender<StackCommand>,
+    ) -> Self {
+        Self {
+            handle,
+            local_addr,
+            commands,
+        }
+    }
+
+    /// Accept an incoming connection.
+    ///
+    /// Returns the connected stream and the peer's address.
+    pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.commands
+            .send(StackCommand::TcpAccept {
+                handle: self.handle,
+                response: tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+
+        let (stream_handle, peer_addr) = rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+
+        Ok((
+            TcpStream::from_handle(stream_handle, self.commands.clone()),
+            peer_addr,
+        ))
+    }
+
+    /// Returns the local address this listener is bound to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Close the listener.
+    pub fn close(&self) {
+        let _ = self.commands.send(StackCommand::TcpListenerClose {
+            handle: self.handle,
+        });
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        self.close();
+    }
+}

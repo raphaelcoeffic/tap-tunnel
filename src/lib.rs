@@ -76,7 +76,9 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-pub use socket::{TcpListener as TunnelTcpListener, TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket};
+pub use socket::{
+    TcpListener as TunnelTcpListener, TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket,
+};
 
 /// Configuration for the TAP tunnel.
 ///
@@ -351,7 +353,10 @@ impl Tunnel {
 
     /// Synchronous version of connect_with_config.
     pub fn connect_with_config_blocking(pid: u32, mut config: TapConfig) -> io::Result<Self> {
-        use protocol::{ClientHello, ProxyConfig, decode_control, decode_message, encode_control, Message, default_client_ip};
+        use protocol::{
+            ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
+            encode_control,
+        };
         use std::io::{Read, Write};
 
         // Create socketpair for frame relay (SEQPACKET for message boundaries)
@@ -395,7 +400,8 @@ impl Tunnel {
         let gateway = Some((proxy_config.tap_ip, proxy_config.tap_mac));
 
         // Client picks its own IP: use configured local_addr or default (tap_ip + 1)
-        let client_ip = config.local_addr
+        let client_ip = config
+            .local_addr
             .map(|(ip, _)| ip)
             .unwrap_or_else(|| default_client_ip(proxy_config.tap_ip));
 
@@ -455,7 +461,10 @@ impl Tunnel {
         socket_path: impl AsRef<Path>,
         local_ip: Option<Ipv4Addr>,
     ) -> io::Result<Self> {
-        use protocol::{ClientHello, ProxyConfig, decode_control, decode_message, encode_control, Message, default_client_ip};
+        use protocol::{
+            ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
+            encode_control,
+        };
         use std::io::{Read, Write};
 
         let socket_path = socket_path.as_ref();
@@ -563,7 +572,7 @@ impl Tunnel {
 
         // Spawn IPC reader thread (proxy -> stack)
         let ipc_reader_thread = std::thread::spawn(move || {
-            use protocol::{decode_message, Message};
+            use protocol::{Message, decode_message};
             debug!("[IPC-RX] reader thread starting");
             let mut buf = [0u8; 1600];
             loop {
@@ -634,7 +643,11 @@ impl Tunnel {
 
         self.inner
             .commands
-            .send(StackCommand::TcpConnect { local_ip: None, addr, response: tx })
+            .send(StackCommand::TcpConnect {
+                local_ip: None,
+                addr,
+                response: tx,
+            })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
 
         let handle = rx
@@ -670,7 +683,7 @@ impl Tunnel {
     /// # }
     /// ```
     pub async fn tcp_listen(&self, addr: SocketAddr) -> io::Result<TcpListener> {
-        self.tcp_listen_with_backlog(addr, 16).await
+        self.tcp_listen_with_backlog(addr, 8).await
     }
 
     /// Create a TCP listener with a specified backlog.

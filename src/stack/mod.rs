@@ -28,6 +28,8 @@ type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
 pub enum StackCommand {
     /// Create a TCP socket and initiate connection.
     TcpConnect {
+        /// Optional local IP to bind the socket to. If None, uses the default (config.ip).
+        local_ip: Option<Ipv4Addr>,
         addr: SocketAddr,
         response: ResponseSender<SocketHandle>,
     },
@@ -77,6 +79,21 @@ pub enum StackCommand {
     },
     /// Close a UDP socket.
     UdpClose { handle: SocketHandle },
+    /// Add an IP address to the smoltcp interface.
+    AddIp {
+        ip: Ipv4Addr,
+        prefix_len: u8,
+        response: oneshot::Sender<io::Result<()>>,
+    },
+    /// Remove an IP address from the smoltcp interface.
+    RemoveIp {
+        ip: Ipv4Addr,
+        response: oneshot::Sender<io::Result<()>>,
+    },
+    /// Get all IP addresses on the smoltcp interface.
+    GetIps {
+        response: oneshot::Sender<Vec<(Ipv4Addr, u8)>>,
+    },
     /// Shutdown the stack thread.
     Shutdown,
 }
@@ -209,8 +226,8 @@ fn handle_command(
     config: &StackConfig,
 ) -> bool {
     match cmd {
-        StackCommand::TcpConnect { addr, response } => {
-            handle_tcp_connect(addr, iface, sockets, pending, config, response);
+        StackCommand::TcpConnect { local_ip, addr, response } => {
+            handle_tcp_connect(local_ip, addr, iface, sockets, pending, config, response);
         }
         StackCommand::TcpListen {
             addr,
@@ -259,6 +276,15 @@ fn handle_command(
         StackCommand::UdpClose { handle } => {
             handle_udp_close(handle, sockets, pending);
         }
+        StackCommand::AddIp { ip, prefix_len, response } => {
+            handle_add_ip(ip, prefix_len, iface, response);
+        }
+        StackCommand::RemoveIp { ip, response } => {
+            handle_remove_ip(ip, iface, response);
+        }
+        StackCommand::GetIps { response } => {
+            handle_get_ips(iface, response);
+        }
         StackCommand::Shutdown => {
             return false;
         }
@@ -267,6 +293,7 @@ fn handle_command(
 }
 
 fn handle_tcp_connect(
+    local_ip: Option<Ipv4Addr>,
     addr: SocketAddr,
     iface: &mut Interface,
     sockets: &mut SocketSet<'_>,
@@ -274,7 +301,7 @@ fn handle_tcp_connect(
     config: &StackConfig,
     response: oneshot::Sender<io::Result<SocketHandle>>,
 ) {
-    debug!("tcp_connect to {}", addr);
+    debug!("tcp_connect to {} from {:?}", addr, local_ip);
 
     // Create TCP socket with buffers
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
@@ -287,14 +314,17 @@ fn handle_tcp_connect(
     // Convert address
     let remote = socket_addr_to_endpoint(addr);
 
+    // Use provided local_ip or fall back to config.ip
+    let source_ip = local_ip.unwrap_or(config.ip);
+
     // Use ephemeral local port
     let local_port = allocate_ephemeral_port();
     let local = IpListenEndpoint {
-        addr: Some(IpAddress::Ipv4(config.ip)),
+        addr: Some(IpAddress::Ipv4(source_ip)),
         port: local_port,
     };
 
-    trace!("tcp_connect: local port {}", local_port);
+    trace!("tcp_connect: local {}:{}", source_ip, local_port);
 
     // Initiate connection
     let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -738,6 +768,66 @@ fn handle_udp_close(
     socket.close();
     pending.remove(&handle);
     debug!("UDP closed: handle={:?}", handle);
+}
+
+fn handle_add_ip(
+    ip: Ipv4Addr,
+    prefix_len: u8,
+    iface: &mut Interface,
+    response: oneshot::Sender<io::Result<()>>,
+) {
+    debug!("add_ip: {}/{}", ip, prefix_len);
+    let cidr = IpCidr::new(IpAddress::Ipv4(ip), prefix_len);
+
+    // Check if already present
+    let already_present = iface.ip_addrs().iter().any(|a| a == &cidr);
+    if already_present {
+        let _ = response.send(Ok(()));
+        return;
+    }
+
+    // Try to add the IP
+    let mut add_result = Ok(());
+    iface.update_ip_addrs(|addrs| {
+        if addrs.push(cidr).is_err() {
+            add_result = Err(io::Error::new(io::ErrorKind::OutOfMemory, "address list full"));
+        }
+    });
+
+    let _ = response.send(add_result);
+}
+
+fn handle_remove_ip(
+    ip: Ipv4Addr,
+    iface: &mut Interface,
+    response: oneshot::Sender<io::Result<()>>,
+) {
+    debug!("remove_ip: {}", ip);
+    let target = smoltcp::wire::Ipv4Address::from(ip.octets());
+
+    iface.update_ip_addrs(|addrs| {
+        addrs.retain(|a| match a {
+            IpCidr::Ipv4(cidr) => cidr.address() != target,
+        });
+    });
+
+    let _ = response.send(Ok(()));
+}
+
+fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<(Ipv4Addr, u8)>>) {
+    let ips: Vec<_> = iface
+        .ip_addrs()
+        .iter()
+        .filter_map(|cidr| match cidr {
+            IpCidr::Ipv4(c) => {
+                let octets = c.address().octets();
+                Some((Ipv4Addr::from(octets), c.prefix_len()))
+            }
+        })
+        .collect();
+
+    debug!("get_ips: {:?}", ips);
+    let _ = response.send(ips);
 }
 
 /// Process pending operations that may now be completable.

@@ -15,23 +15,26 @@ pub const MSG_TYPE_CONTROL: u8 = 0x00;
 pub const MSG_TYPE_FRAME: u8 = 0x01;
 
 /// Client hello message sent at connection start.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// This is currently an empty struct but allows for future extensibility
+/// (e.g., version negotiation, capability flags).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientHello {
-    /// Client's requested IP address, if any.
-    /// If None, the proxy will assign one automatically.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_ip: Option<Ipv4Addr>,
+    // Empty - client manages its own IPs
 }
 
 /// Proxy configuration sent to client after handshake.
+///
+/// The proxy only provides its identity (TAP IP, MAC, prefix).
+/// The client is responsible for picking and managing its own IPs from the subnet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// IP address of the TAP interface (gateway for client).
     pub tap_ip: Ipv4Addr,
+    /// MAC address of the TAP interface.
+    pub tap_mac: [u8; 6],
     /// Subnet prefix length.
     pub prefix_len: u8,
-    /// IP address assigned to this client.
-    pub assigned_ip: Ipv4Addr,
 }
 
 /// Decoded message from the wire.
@@ -116,15 +119,13 @@ mod tests {
 
     #[test]
     fn test_encode_decode_control() {
-        let hello = ClientHello {
-            requested_ip: Some(Ipv4Addr::new(10, 0, 0, 5)),
-        };
+        let hello = ClientHello::default();
 
         let encoded = encode_control(&hello).unwrap();
         assert_eq!(encoded[0], MSG_TYPE_CONTROL);
 
-        let decoded: ClientHello = decode_control(&encoded[1..]).unwrap();
-        assert_eq!(decoded.requested_ip, Some(Ipv4Addr::new(10, 0, 0, 5)));
+        let _decoded: ClientHello = decode_control(&encoded[1..]).unwrap();
+        // ClientHello is now empty, so just verify it deserializes
     }
 
     #[test]

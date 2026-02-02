@@ -32,7 +32,6 @@ use namespace::join_namespace;
 use tap::{bring_interface_up, configure_interface_ip, create_tap, get_interface_mac};
 use tap_tunnel::protocol::{
     ClientHello, Message, ProxyConfig, decode_control, decode_message, encode_control, encode_frame,
-    default_client_ip, validate_ip_in_subnet,
 };
 use tap_tunnel::TapConfig;
 
@@ -150,12 +149,34 @@ fn parse_ip_prefix(s: &str) -> Option<(Ipv4Addr, u8)> {
 }
 
 fn run(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
-    // Perform protocol handshake
-    let assigned_ip = perform_handshake(&frame_fd, &config)?;
-    debug!("handshake complete, assigned IP: {}", assigned_ip);
+    // 1. Create and configure TAP interface BEFORE handshake so we have MAC
+    let tap_fd = create_tap(&config.interface_name)?;
+    debug!("created TAP interface: {}", config.interface_name);
 
+    // Configure IP address if specified (peer_addr is the TAP interface address)
+    if let Some((ip, prefix_len)) = config.peer_addr {
+        configure_interface_ip(&config.interface_name, ip, prefix_len)?;
+        debug!("configured IP: {}/{}", ip, prefix_len);
+    }
+
+    // Bring the interface up
+    bring_interface_up(&config.interface_name)?;
+    debug!("interface {} is up", config.interface_name);
+
+    // Get TAP interface MAC address
+    let tap_mac = get_interface_mac(&config.interface_name)?;
+    debug!(
+        "TAP MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        tap_mac[0], tap_mac[1], tap_mac[2], tap_mac[3], tap_mac[4], tap_mac[5]
+    );
+
+    // 2. Perform protocol handshake - send proxy identity to client
+    perform_handshake(&frame_fd, &config, tap_mac)?;
+    debug!("handshake complete");
+
+    // 3. Start async runtime for frame relay
     let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(run_proxy(frame_fd, config))
+    runtime.block_on(run_proxy(frame_fd, tap_fd, tap_mac, config))
 }
 
 /// Run in socket-path mode: bind, listen, accept a connection, then run proxy with handshake.
@@ -175,10 +196,14 @@ fn run_socket_path_mode(socket_path: &std::path::Path, config: TapConfig) -> io:
 }
 
 /// Perform protocol handshake with client.
-fn perform_handshake(fd: &OwnedFd, config: &TapConfig) -> io::Result<Ipv4Addr> {
+///
+/// The handshake is simplified: client sends an empty ClientHello,
+/// proxy responds with its identity (tap_ip, tap_mac, prefix_len).
+/// The client is responsible for picking and managing its own IPs.
+fn perform_handshake(fd: &OwnedFd, config: &TapConfig, tap_mac: [u8; 6]) -> io::Result<()> {
     let raw_fd = fd.as_raw_fd();
 
-    // Receive ClientHello
+    // Receive ClientHello (may be empty)
     let mut buf = [0u8; 1024];
     let n = unsafe {
         libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
@@ -210,32 +235,11 @@ fn perform_handshake(fd: &OwnedFd, config: &TapConfig) -> io::Result<Ipv4Addr> {
         io::Error::new(io::ErrorKind::InvalidInput, "tap_addr must be configured")
     })?;
 
-    // Determine assigned IP
-    let assigned_ip = if let Some(requested) = hello.requested_ip {
-        // Validate requested IP is in subnet
-        if !validate_ip_in_subnet(requested, tap_ip, prefix_len) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("requested IP {} is not in subnet", requested),
-            ));
-        }
-        // Don't allow client to take the TAP IP
-        if requested == tap_ip {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "requested IP is the TAP interface IP",
-            ));
-        }
-        requested
-    } else {
-        default_client_ip(tap_ip)
-    };
-
-    // Send ProxyConfig
+    // Send ProxyConfig with proxy identity
     let proxy_config = ProxyConfig {
         tap_ip,
+        tap_mac,
         prefix_len,
-        assigned_ip,
     };
     let config_msg = encode_control(&proxy_config)?;
     let written = unsafe {
@@ -246,7 +250,7 @@ fn perform_handshake(fd: &OwnedFd, config: &TapConfig) -> io::Result<Ipv4Addr> {
     }
     debug!("sent ProxyConfig: {:?}", proxy_config);
 
-    Ok(assigned_ip)
+    Ok(())
 }
 
 /// Build a gratuitous ARP reply frame.
@@ -394,29 +398,10 @@ impl AsyncWrite for AsyncFdIo {
 }
 
 /// Run the TAP proxy with type-prefixed message protocol.
-async fn run_proxy(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
+///
+/// The TAP device is pre-created so the MAC is available for the handshake.
+async fn run_proxy(frame_fd: OwnedFd, tap_fd: OwnedFd, tap_mac: [u8; 6], config: TapConfig) -> io::Result<()> {
     debug!("TAP proxy starting");
-
-    // Create TAP interface
-    let tap_fd = create_tap(&config.interface_name)?;
-    debug!("created TAP interface: {}", config.interface_name);
-
-    // Configure IP address if specified (peer_addr is the TAP interface address)
-    if let Some((ip, prefix_len)) = config.peer_addr {
-        configure_interface_ip(&config.interface_name, ip, prefix_len)?;
-        debug!("configured IP: {}/{}", ip, prefix_len);
-    }
-
-    // Bring the interface up
-    bring_interface_up(&config.interface_name)?;
-    debug!("interface {} is up", config.interface_name);
-
-    // Get TAP interface MAC address
-    let tap_mac = get_interface_mac(&config.interface_name)?;
-    debug!(
-        "TAP MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        tap_mac[0], tap_mac[1], tap_mac[2], tap_mac[3], tap_mac[4], tap_mac[5]
-    );
 
     // Wrap SEQPACKET socket in async wrapper
     let mut frame_socket = AsyncFdIo::new(frame_fd)?;

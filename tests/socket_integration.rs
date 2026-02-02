@@ -1214,3 +1214,290 @@ time.sleep(0.3)
     );
     UserNetNamespace::new(&script)
 }
+
+// ============================================================================
+// Multi-IP API Tests
+// ============================================================================
+
+/// Test that gateway() returns the proxy's TAP IP and MAC address.
+#[tokio::test]
+async fn test_tunnel_gateway() {
+    let ns_proc = tcp_echo_server_ns(19200).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect");
+
+    // Gateway should be available and contain the TAP IP
+    let gateway = tunnel.gateway();
+    assert!(gateway.is_some(), "gateway should be available");
+
+    let (tap_ip, tap_mac) = gateway.unwrap();
+    assert_eq!(tap_ip, PEER_IP, "gateway IP should match peer_addr");
+
+    // MAC should be a valid non-zero address
+    assert!(
+        tap_mac.iter().any(|&b| b != 0),
+        "MAC address should not be all zeros"
+    );
+}
+
+/// Test that local_ips() returns the configured IP addresses.
+#[tokio::test]
+async fn test_tunnel_local_ips() {
+    let ns_proc = tcp_echo_server_ns(19201).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect");
+
+    // Should have at least the initial local IP
+    let ips = tunnel.local_ips().await.expect("failed to get local IPs");
+    assert!(!ips.is_empty(), "should have at least one IP");
+
+    // The default local IP should be present
+    let has_local_ip = ips.iter().any(|(ip, _)| *ip == LOCAL_IP);
+    assert!(has_local_ip, "local_ips should contain {}", LOCAL_IP);
+}
+
+/// Test adding and removing IP addresses.
+#[tokio::test]
+async fn test_tunnel_add_remove_ip() {
+    let ns_proc = tcp_echo_server_ns(19202).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect");
+
+    // Get initial IPs
+    let initial_ips = tunnel.local_ips().await.expect("failed to get local IPs");
+    let initial_count = initial_ips.len();
+
+    // Add a new IP
+    let new_ip = Ipv4Addr::new(10, 0, 0, 100);
+    tunnel
+        .add_local_ip(new_ip, PREFIX_LEN)
+        .await
+        .expect("failed to add IP");
+
+    // Verify it was added
+    let ips_after_add = tunnel.local_ips().await.expect("failed to get local IPs");
+    assert_eq!(
+        ips_after_add.len(),
+        initial_count + 1,
+        "should have one more IP after add"
+    );
+    assert!(
+        ips_after_add.iter().any(|(ip, _)| *ip == new_ip),
+        "new IP should be present"
+    );
+
+    // Adding the same IP again should be idempotent
+    tunnel
+        .add_local_ip(new_ip, PREFIX_LEN)
+        .await
+        .expect("adding same IP again should succeed");
+    let ips_after_dup = tunnel.local_ips().await.expect("failed to get local IPs");
+    assert_eq!(
+        ips_after_dup.len(),
+        initial_count + 1,
+        "adding same IP should not increase count"
+    );
+
+    // Remove the IP
+    tunnel
+        .remove_local_ip(new_ip)
+        .await
+        .expect("failed to remove IP");
+
+    // Verify it was removed
+    let ips_after_remove = tunnel.local_ips().await.expect("failed to get local IPs");
+    assert_eq!(
+        ips_after_remove.len(),
+        initial_count,
+        "should be back to initial count"
+    );
+    assert!(
+        !ips_after_remove.iter().any(|(ip, _)| *ip == new_ip),
+        "removed IP should not be present"
+    );
+}
+
+/// Test tcp_connect_from() - connecting from a specific local IP.
+#[tokio::test]
+async fn test_tunnel_tcp_connect_from() {
+    let ns_proc = tcp_echo_server_ns(19203).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect");
+
+    // Connect from the default local IP using tcp_connect_from
+    let server_addr = format!("{}:19203", PEER_IP).parse().unwrap();
+    let stream = tunnel
+        .tcp_connect_from(LOCAL_IP, server_addr)
+        .await
+        .expect("failed to tcp_connect_from");
+
+    // Send and receive data
+    stream
+        .write_all(b"connect_from test\n")
+        .await
+        .expect("write failed");
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"connect_from test\n");
+}
+
+/// Test connecting from a dynamically added IP address.
+#[tokio::test]
+async fn test_tunnel_tcp_connect_from_added_ip() {
+    let ns_proc = tcp_echo_server_ns(19204).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect");
+
+    // Add a new IP address
+    let new_ip = Ipv4Addr::new(10, 0, 0, 50);
+    tunnel
+        .add_local_ip(new_ip, PREFIX_LEN)
+        .await
+        .expect("failed to add IP");
+
+    // Verify the IP was added
+    let ips = tunnel.local_ips().await.expect("failed to get IPs");
+    assert!(ips.iter().any(|(ip, _)| *ip == new_ip), "new IP should be added");
+
+    // Connect from the new IP
+    let server_addr = format!("{}:19204", PEER_IP).parse().unwrap();
+    let stream = tunnel
+        .tcp_connect_from(new_ip, server_addr)
+        .await
+        .expect("failed to tcp_connect_from new IP");
+
+    // Send and receive data
+    stream
+        .write_all(b"from new IP\n")
+        .await
+        .expect("write failed");
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"from new IP\n");
+}
+
+/// Test multiple connections from different local IPs.
+#[tokio::test]
+async fn test_tunnel_multi_ip_connections() {
+    let ns_proc = tcp_echo_server_ns(19205).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect");
+
+    // Add two more IPs
+    let ip2 = Ipv4Addr::new(10, 0, 0, 20);
+    let ip3 = Ipv4Addr::new(10, 0, 0, 30);
+    tunnel.add_local_ip(ip2, PREFIX_LEN).await.expect("failed to add IP 2");
+    tunnel.add_local_ip(ip3, PREFIX_LEN).await.expect("failed to add IP 3");
+
+    // Verify all IPs are present
+    let ips = tunnel.local_ips().await.expect("failed to get IPs");
+    assert!(ips.iter().any(|(ip, _)| *ip == LOCAL_IP), "default IP should be present");
+    assert!(ips.iter().any(|(ip, _)| *ip == ip2), "IP 2 should be present");
+    assert!(ips.iter().any(|(ip, _)| *ip == ip3), "IP 3 should be present");
+
+    let server_addr: std::net::SocketAddr = format!("{}:19205", PEER_IP).parse().unwrap();
+
+    // Connect from each IP and verify they all work
+    for (i, ip) in [LOCAL_IP, ip2, ip3].iter().enumerate() {
+        let stream = tunnel
+            .tcp_connect_from(*ip, server_addr)
+            .await
+            .unwrap_or_else(|e| panic!("failed to connect from {}: {}", ip, e));
+
+        let msg = format!("msg from {}\n", ip);
+        stream.write_all(msg.as_bytes()).await.expect("write failed");
+
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.expect("read failed");
+        assert_eq!(
+            &buf[..n],
+            msg.as_bytes(),
+            "connection {} from {} failed",
+            i,
+            ip
+        );
+    }
+}
+
+/// Test socket-path mode with gateway() API.
+#[tokio::test]
+async fn test_socket_path_mode_gateway() {
+    use std::path::Path;
+
+    let socket_path = format!("/tmp/tap-tunnel-test-gw-{}.sock", std::process::id());
+    let _ = std::fs::remove_file(&socket_path);
+
+    let ns_proc = tcp_echo_server_ns(19206).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let _proxy = ProxyProcess::new(pid, &socket_path)
+        .expect("failed to start proxy");
+
+    // Wait for socket
+    for _ in 0..50 {
+        if Path::new(&socket_path).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect via socket path
+    let tunnel = Tunnel::connect_to(&socket_path, None)
+        .await
+        .expect("failed to connect");
+
+    // Gateway should be available
+    let gateway = tunnel.gateway();
+    assert!(gateway.is_some(), "gateway should be available in socket-path mode");
+
+    let (tap_ip, tap_mac) = gateway.unwrap();
+    assert_eq!(tap_ip, PEER_IP, "gateway IP should match");
+    assert!(tap_mac.iter().any(|&b| b != 0), "MAC should not be all zeros");
+
+    // Verify connectivity still works
+    let server_addr = format!("{}:19206", PEER_IP).parse().unwrap();
+    let stream = tunnel.tcp_connect(server_addr).await.expect("connect failed");
+    stream.write_all(b"gateway test\n").await.expect("write failed");
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"gateway test\n");
+
+    let _ = std::fs::remove_file(&socket_path);
+}

@@ -175,6 +175,8 @@ struct TunnelInner {
     stack_thread: Mutex<Option<JoinHandle<()>>>,
     /// IPC reader thread handle
     ipc_reader_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Gateway info from proxy: (tap_ip, tap_mac)
+    gateway: Option<(Ipv4Addr, [u8; 6])>,
 }
 
 impl Drop for TunnelInner {
@@ -349,7 +351,7 @@ impl Tunnel {
 
     /// Synchronous version of connect_with_config.
     pub fn connect_with_config_blocking(pid: u32, mut config: TapConfig) -> io::Result<Self> {
-        use protocol::{ClientHello, ProxyConfig, decode_control, decode_message, encode_control, Message};
+        use protocol::{ClientHello, ProxyConfig, decode_control, decode_message, encode_control, Message, default_client_ip};
         use std::io::{Read, Write};
 
         // Create socketpair for frame relay (SEQPACKET for message boundaries)
@@ -361,14 +363,13 @@ impl Tunnel {
         // Convert to UnixStream for handshake
         let mut stream = fd_to_unix_stream(parent_fd)?;
 
-        // Send ClientHello - request the local_addr if configured, otherwise let proxy assign
-        let requested_ip = config.local_addr.map(|(ip, _)| ip);
-        let hello = ClientHello { requested_ip };
+        // Send ClientHello (now empty - client manages its own IPs)
+        let hello = ClientHello::default();
         let hello_msg = encode_control(&hello)?;
         stream.write_all(&hello_msg)?;
         debug!("sent ClientHello: {:?}", hello);
 
-        // Receive ProxyConfig
+        // Receive ProxyConfig (contains proxy identity: tap_ip, tap_mac, prefix_len)
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf)?;
         if n == 0 {
@@ -390,10 +391,18 @@ impl Tunnel {
         };
         debug!("received ProxyConfig: {:?}", proxy_config);
 
-        // Update config with values from proxy
+        // Store gateway info
+        let gateway = Some((proxy_config.tap_ip, proxy_config.tap_mac));
+
+        // Client picks its own IP: use configured local_addr or default (tap_ip + 1)
+        let client_ip = config.local_addr
+            .map(|(ip, _)| ip)
+            .unwrap_or_else(|| default_client_ip(proxy_config.tap_ip));
+
+        // Update config with proxy info and client-picked IP
         config = config
             .peer_addr(proxy_config.tap_ip, proxy_config.prefix_len)
-            .local_addr(proxy_config.assigned_ip, proxy_config.prefix_len);
+            .local_addr(client_ip, proxy_config.prefix_len);
 
         // Use PID-based MAC if not explicitly set
         if config.mac.is_none() {
@@ -409,14 +418,15 @@ impl Tunnel {
             unsafe { OwnedFd::from_raw_fd(raw_fd) }
         };
 
-        Self::setup_stack_from_fd(frame_fd, config, Some(proxy_child))
+        Self::setup_stack_from_fd(frame_fd, config, Some(proxy_child), gateway)
     }
 
     /// Connect to a proxy already listening on the given Unix socket path.
     ///
-    /// This performs a handshake with the proxy to receive IP configuration
-    /// automatically. If `requested_ip` is provided, the proxy will try to
-    /// assign that IP; otherwise it assigns one automatically.
+    /// This performs a handshake with the proxy to receive its identity
+    /// (TAP IP, MAC, prefix). The client then picks its own IP from the subnet.
+    /// If `local_ip` is provided, that IP will be used; otherwise a default
+    /// (tap_ip + 1) is used.
     ///
     /// # Example
     ///
@@ -425,27 +435,27 @@ impl Tunnel {
     /// use std::net::Ipv4Addr;
     ///
     /// # async fn example() -> std::io::Result<()> {
-    /// // Auto-assign IP
+    /// // Use default IP (tap_ip + 1)
     /// let tunnel = Tunnel::connect_to("/tmp/tunnel.sock", None).await?;
     ///
-    /// // Request specific IP
+    /// // Use specific IP
     /// let tunnel = Tunnel::connect_to("/tmp/tunnel.sock", Some(Ipv4Addr::new(10, 0, 0, 5))).await?;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn connect_to(
         socket_path: impl AsRef<Path>,
-        requested_ip: Option<Ipv4Addr>,
+        local_ip: Option<Ipv4Addr>,
     ) -> io::Result<Self> {
-        Self::connect_to_blocking(socket_path, requested_ip)
+        Self::connect_to_blocking(socket_path, local_ip)
     }
 
     /// Synchronous version of `connect_to`.
     pub fn connect_to_blocking(
         socket_path: impl AsRef<Path>,
-        requested_ip: Option<Ipv4Addr>,
+        local_ip: Option<Ipv4Addr>,
     ) -> io::Result<Self> {
-        use protocol::{ClientHello, ProxyConfig, decode_control, decode_message, encode_control, Message};
+        use protocol::{ClientHello, ProxyConfig, decode_control, decode_message, encode_control, Message, default_client_ip};
         use std::io::{Read, Write};
 
         let socket_path = socket_path.as_ref();
@@ -457,13 +467,13 @@ impl Tunnel {
         // Convert to UnixStream for handshake
         let mut stream = fd_to_unix_stream(frame_fd)?;
 
-        // Send ClientHello
-        let hello = ClientHello { requested_ip };
+        // Send ClientHello (empty - client manages its own IPs)
+        let hello = ClientHello::default();
         let hello_msg = encode_control(&hello)?;
         stream.write_all(&hello_msg)?;
         debug!("sent ClientHello: {:?}", hello);
 
-        // Receive ProxyConfig
+        // Receive ProxyConfig (contains proxy identity: tap_ip, tap_mac, prefix_len)
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf)?;
         if n == 0 {
@@ -485,10 +495,16 @@ impl Tunnel {
         };
         debug!("received ProxyConfig: {:?}", proxy_config);
 
+        // Store gateway info
+        let gateway = Some((proxy_config.tap_ip, proxy_config.tap_mac));
+
+        // Client picks its own IP: use provided local_ip or default (tap_ip + 1)
+        let client_ip = local_ip.unwrap_or_else(|| default_client_ip(proxy_config.tap_ip));
+
         // Build TapConfig from received config
         let config = TapConfig::new()
             .peer_addr(proxy_config.tap_ip, proxy_config.prefix_len)
-            .local_addr(proxy_config.assigned_ip, proxy_config.prefix_len);
+            .local_addr(client_ip, proxy_config.prefix_len);
 
         // Get the FD back from the stream
         let frame_fd = {
@@ -498,7 +514,7 @@ impl Tunnel {
         };
 
         // Set up the stack with protocol-aware IPC
-        Self::setup_stack_from_fd(frame_fd, config, None)
+        Self::setup_stack_from_fd(frame_fd, config, None, gateway)
     }
 
     /// Common setup code: given a connected frame FD, set up channels, IPC threads, and stack.
@@ -508,6 +524,7 @@ impl Tunnel {
         frame_fd: OwnedFd,
         config: TapConfig,
         proxy_child: Option<Child>,
+        gateway: Option<(Ipv4Addr, [u8; 6])>,
     ) -> io::Result<Self> {
         // Set up channels for stack communication
         let (cmd_tx, cmd_rx) = bounded::<StackCommand>(256);
@@ -530,14 +547,14 @@ impl Tunnel {
             io::Error::new(io::ErrorKind::InvalidInput, "local_addr must be configured")
         })?;
 
-        // Gateway is the peer address (TAP interface in namespace)
-        let gateway = config.peer_addr.map(|(ip, _)| ip);
+        // Gateway IP is the peer address (TAP interface in namespace)
+        let gateway_ip = config.peer_addr.map(|(ip, _)| ip);
 
         let stack_config = StackConfig {
             mac,
             ip: local_ip,
             prefix_len: local_prefix,
-            gateway,
+            gateway: gateway_ip,
         };
 
         // Clone for IPC threads
@@ -604,17 +621,20 @@ impl Tunnel {
                 proxy_child: Mutex::new(proxy_child),
                 stack_thread: Mutex::new(Some(stack_thread)),
                 ipc_reader_thread: Mutex::new(Some(ipc_reader_thread)),
+                gateway,
             }),
         })
     }
 
     /// Create a TCP connection to the given address.
+    ///
+    /// Uses the default local IP (the first IP configured on the stack).
     pub async fn tcp_connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.inner
             .commands
-            .send(StackCommand::TcpConnect { addr, response: tx })
+            .send(StackCommand::TcpConnect { local_ip: None, addr, response: tx })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
 
         let handle = rx
@@ -698,6 +718,88 @@ impl Tunnel {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
 
         Ok(UdpSocket::from_handle(handle, self.inner.commands.clone()))
+    }
+
+    /// Create a TCP connection from a specific local IP address.
+    ///
+    /// Use this when you have multiple IPs configured on the tunnel
+    /// and want to bind to a specific one for the outgoing connection.
+    pub async fn tcp_connect_from(
+        &self,
+        local_ip: Ipv4Addr,
+        remote_addr: SocketAddr,
+    ) -> io::Result<TcpStream> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.inner
+            .commands
+            .send(StackCommand::TcpConnect {
+                local_ip: Some(local_ip),
+                addr: remote_addr,
+                response: tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+
+        let handle = rx
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+
+        Ok(TcpStream::from_handle(handle, self.inner.commands.clone()))
+    }
+
+    /// Add a local IP address to the smoltcp interface.
+    ///
+    /// This allows the tunnel to send/receive traffic using this IP.
+    /// The prefix length determines the subnet mask for routing.
+    pub async fn add_local_ip(&self, ip: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.inner
+            .commands
+            .send(StackCommand::AddIp {
+                ip,
+                prefix_len,
+                response: tx,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?
+    }
+
+    /// Remove a local IP address from the smoltcp interface.
+    pub async fn remove_local_ip(&self, ip: Ipv4Addr) -> io::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.inner
+            .commands
+            .send(StackCommand::RemoveIp { ip, response: tx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?
+    }
+
+    /// Get current local IP addresses on the smoltcp interface.
+    ///
+    /// Returns a list of (IP, prefix_len) pairs.
+    pub async fn local_ips(&self) -> io::Result<Vec<(Ipv4Addr, u8)>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.inner
+            .commands
+            .send(StackCommand::GetIps { response: tx })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))
+    }
+
+    /// Get the proxy's gateway info (TAP IP and MAC address).
+    ///
+    /// Returns `None` if the tunnel was not set up with gateway info.
+    pub fn gateway(&self) -> Option<(Ipv4Addr, [u8; 6])> {
+        self.inner.gateway
     }
 }
 

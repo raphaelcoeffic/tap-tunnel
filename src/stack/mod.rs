@@ -226,7 +226,11 @@ fn handle_command(
     config: &StackConfig,
 ) -> bool {
     match cmd {
-        StackCommand::TcpConnect { local_ip, addr, response } => {
+        StackCommand::TcpConnect {
+            local_ip,
+            addr,
+            response,
+        } => {
             handle_tcp_connect(local_ip, addr, iface, sockets, pending, config, response);
         }
         StackCommand::TcpListen {
@@ -276,7 +280,11 @@ fn handle_command(
         StackCommand::UdpClose { handle } => {
             handle_udp_close(handle, sockets, pending);
         }
-        StackCommand::AddIp { ip, prefix_len, response } => {
+        StackCommand::AddIp {
+            ip,
+            prefix_len,
+            response,
+        } => {
             handle_add_ip(ip, prefix_len, iface, response);
         }
         StackCommand::RemoveIp { ip, response } => {
@@ -790,7 +798,10 @@ fn handle_add_ip(
     let mut add_result = Ok(());
     iface.update_ip_addrs(|addrs| {
         if addrs.push(cidr).is_err() {
-            add_result = Err(io::Error::new(io::ErrorKind::OutOfMemory, "address list full"));
+            add_result = Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "address list full",
+            ));
         }
     });
 

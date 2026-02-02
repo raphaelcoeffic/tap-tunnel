@@ -1383,7 +1383,10 @@ async fn test_tunnel_tcp_connect_from_added_ip() {
 
     // Verify the IP was added
     let ips = tunnel.local_ips().await.expect("failed to get IPs");
-    assert!(ips.iter().any(|(ip, _)| *ip == new_ip), "new IP should be added");
+    assert!(
+        ips.iter().any(|(ip, _)| *ip == new_ip),
+        "new IP should be added"
+    );
 
     // Connect from the new IP
     let server_addr = format!("{}:19204", PEER_IP).parse().unwrap();
@@ -1418,14 +1421,29 @@ async fn test_tunnel_multi_ip_connections() {
     // Add two more IPs
     let ip2 = Ipv4Addr::new(10, 0, 0, 20);
     let ip3 = Ipv4Addr::new(10, 0, 0, 30);
-    tunnel.add_local_ip(ip2, PREFIX_LEN).await.expect("failed to add IP 2");
-    tunnel.add_local_ip(ip3, PREFIX_LEN).await.expect("failed to add IP 3");
+    tunnel
+        .add_local_ip(ip2, PREFIX_LEN)
+        .await
+        .expect("failed to add IP 2");
+    tunnel
+        .add_local_ip(ip3, PREFIX_LEN)
+        .await
+        .expect("failed to add IP 3");
 
     // Verify all IPs are present
     let ips = tunnel.local_ips().await.expect("failed to get IPs");
-    assert!(ips.iter().any(|(ip, _)| *ip == LOCAL_IP), "default IP should be present");
-    assert!(ips.iter().any(|(ip, _)| *ip == ip2), "IP 2 should be present");
-    assert!(ips.iter().any(|(ip, _)| *ip == ip3), "IP 3 should be present");
+    assert!(
+        ips.iter().any(|(ip, _)| *ip == LOCAL_IP),
+        "default IP should be present"
+    );
+    assert!(
+        ips.iter().any(|(ip, _)| *ip == ip2),
+        "IP 2 should be present"
+    );
+    assert!(
+        ips.iter().any(|(ip, _)| *ip == ip3),
+        "IP 3 should be present"
+    );
 
     let server_addr: std::net::SocketAddr = format!("{}:19205", PEER_IP).parse().unwrap();
 
@@ -1437,7 +1455,10 @@ async fn test_tunnel_multi_ip_connections() {
             .unwrap_or_else(|e| panic!("failed to connect from {}: {}", ip, e));
 
         let msg = format!("msg from {}\n", ip);
-        stream.write_all(msg.as_bytes()).await.expect("write failed");
+        stream
+            .write_all(msg.as_bytes())
+            .await
+            .expect("write failed");
 
         let mut buf = [0u8; 64];
         let n = stream.read(&mut buf).await.expect("read failed");
@@ -1464,8 +1485,7 @@ async fn test_socket_path_mode_gateway() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _proxy = ProxyProcess::new(pid, &socket_path)
-        .expect("failed to start proxy");
+    let _proxy = ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
 
     // Wait for socket
     for _ in 0..50 {
@@ -1484,16 +1504,28 @@ async fn test_socket_path_mode_gateway() {
 
     // Gateway should be available
     let gateway = tunnel.gateway();
-    assert!(gateway.is_some(), "gateway should be available in socket-path mode");
+    assert!(
+        gateway.is_some(),
+        "gateway should be available in socket-path mode"
+    );
 
     let (tap_ip, tap_mac) = gateway.unwrap();
     assert_eq!(tap_ip, PEER_IP, "gateway IP should match");
-    assert!(tap_mac.iter().any(|&b| b != 0), "MAC should not be all zeros");
+    assert!(
+        tap_mac.iter().any(|&b| b != 0),
+        "MAC should not be all zeros"
+    );
 
     // Verify connectivity still works
     let server_addr = format!("{}:19206", PEER_IP).parse().unwrap();
-    let stream = tunnel.tcp_connect(server_addr).await.expect("connect failed");
-    stream.write_all(b"gateway test\n").await.expect("write failed");
+    let stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("connect failed");
+    stream
+        .write_all(b"gateway test\n")
+        .await
+        .expect("write failed");
 
     let mut buf = [0u8; 64];
     let n = stream.read(&mut buf).await.expect("read failed");

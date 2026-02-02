@@ -7,13 +7,7 @@ use std::path::Path;
 /// The socket is bound to the given path and set to listen for incoming connections.
 pub fn create_seqpacket_listener(path: &Path) -> io::Result<OwnedFd> {
     // Create SEQPACKET socket
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

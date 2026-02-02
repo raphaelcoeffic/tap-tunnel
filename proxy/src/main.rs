@@ -5,12 +5,14 @@
 //! handshake with the client, then relays Ethernet frames between the TAP device
 //! and the parent process using the type-prefixed message protocol.
 //!
+//! ```
 //! Usage:
 //!   tap-tunnel-proxy --pid <PID> --frame-fd <FD> [--tap-name <NAME>] [--tap-addr <IP/PREFIX>]
 //!   tap-tunnel-proxy --pid <PID> --socket-path <PATH> [--tap-name <NAME>] [--tap-addr <IP/PREFIX>]
 //!   tap-tunnel-proxy --socket-path <PATH> [--tap-name <NAME>] [--tap-addr <IP/PREFIX>]
+//! ```
 //!
-//! When --pid is omitted, the proxy assumes it's already running in the target namespace
+//! When `--pid` is omitted, the proxy assumes it's already running in the target namespace
 //! (e.g., started directly inside a container).
 
 use clap::Parser;
@@ -30,10 +32,10 @@ mod tap;
 use ipc::{accept_seqpacket, create_seqpacket_listener};
 use namespace::join_namespace;
 use tap::{bring_interface_up, configure_interface_ip, create_tap, get_interface_mac};
+use tap_tunnel::TapConfig;
 use tap_tunnel::protocol::{
     ClientHello, Message, ProxyConfig, decode_control, decode_message, encode_control, encode_frame,
 };
-use tap_tunnel::TapConfig;
 
 /// Maximum Ethernet frame size (MTU 1500 + Ethernet header + some margin)
 const MAX_FRAME_SIZE: usize = 1522;
@@ -205,9 +207,7 @@ fn perform_handshake(fd: &OwnedFd, config: &TapConfig, tap_mac: [u8; 6]) -> io::
 
     // Receive ClientHello (may be empty)
     let mut buf = [0u8; 1024];
-    let n = unsafe {
-        libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-    };
+    let n = unsafe { libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -243,7 +243,11 @@ fn perform_handshake(fd: &OwnedFd, config: &TapConfig, tap_mac: [u8; 6]) -> io::
     };
     let config_msg = encode_control(&proxy_config)?;
     let written = unsafe {
-        libc::write(raw_fd, config_msg.as_ptr() as *const libc::c_void, config_msg.len())
+        libc::write(
+            raw_fd,
+            config_msg.as_ptr() as *const libc::c_void,
+            config_msg.len(),
+        )
     };
     if written < 0 {
         return Err(io::Error::last_os_error());
@@ -400,7 +404,12 @@ impl AsyncWrite for AsyncFdIo {
 /// Run the TAP proxy with type-prefixed message protocol.
 ///
 /// The TAP device is pre-created so the MAC is available for the handshake.
-async fn run_proxy(frame_fd: OwnedFd, tap_fd: OwnedFd, tap_mac: [u8; 6], config: TapConfig) -> io::Result<()> {
+async fn run_proxy(
+    frame_fd: OwnedFd,
+    tap_fd: OwnedFd,
+    tap_mac: [u8; 6],
+    config: TapConfig,
+) -> io::Result<()> {
     debug!("TAP proxy starting");
 
     // Wrap SEQPACKET socket in async wrapper
@@ -471,4 +480,3 @@ async fn run_frame_relay(mut tap: AsyncFdIo, mut frame_socket: AsyncFdIo) -> io:
         }
     }
 }
-

@@ -48,8 +48,8 @@ pub enum Message {
 
 /// Encode a control message for transmission.
 pub fn encode_control<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
-    let json = serde_json::to_vec(msg)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let json =
+        serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut buf = Vec::with_capacity(1 + json.len());
     buf.push(MSG_TYPE_CONTROL);
     buf.extend_from_slice(&json);
@@ -58,8 +58,7 @@ pub fn encode_control<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
 
 /// Decode a control message from JSON bytes.
 pub fn decode_control<T: for<'de> Deserialize<'de>>(data: &[u8]) -> io::Result<T> {
-    serde_json::from_slice(data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Encode an Ethernet frame for transmission.
@@ -73,10 +72,7 @@ pub fn encode_frame(frame: &[u8]) -> Vec<u8> {
 /// Decode a message from the wire.
 pub fn decode_message(data: &[u8]) -> io::Result<Message> {
     if data.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "empty message",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty message"));
     }
 
     let msg_type = data[0];
@@ -130,7 +126,9 @@ mod tests {
 
     #[test]
     fn test_encode_decode_frame() {
-        let frame = vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let frame = vec![
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+        ];
         let encoded = encode_frame(&frame);
         assert_eq!(encoded[0], MSG_TYPE_FRAME);
         assert_eq!(&encoded[1..], &frame[..]);
@@ -153,7 +151,15 @@ mod tests {
     #[test]
     fn test_validate_ip_in_subnet() {
         let tap_ip = Ipv4Addr::new(10, 0, 0, 1);
-        assert!(validate_ip_in_subnet(Ipv4Addr::new(10, 0, 0, 5), tap_ip, 24));
-        assert!(!validate_ip_in_subnet(Ipv4Addr::new(10, 0, 1, 5), tap_ip, 24));
+        assert!(validate_ip_in_subnet(
+            Ipv4Addr::new(10, 0, 0, 5),
+            tap_ip,
+            24
+        ));
+        assert!(!validate_ip_in_subnet(
+            Ipv4Addr::new(10, 0, 1, 5),
+            tap_ip,
+            24
+        ));
     }
 }

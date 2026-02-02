@@ -33,13 +33,7 @@ pub fn create_socketpair() -> io::Result<(OwnedFd, OwnedFd)> {
 /// Used by the library to connect to a proxy running in socket-path mode.
 pub fn connect_seqpacket(path: &Path) -> io::Result<OwnedFd> {
     // Create SEQPACKET socket
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }

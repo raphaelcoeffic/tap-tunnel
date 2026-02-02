@@ -57,12 +57,9 @@
 //! # }
 //! ```
 
-mod ipc;
-pub mod namespace;
-pub mod proxy;
+pub(crate) mod ipc;
 pub mod socket;
 mod stack;
-pub(crate) mod tap;
 
 use crossbeam_channel::{Sender, bounded};
 use log::debug;

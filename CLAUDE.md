@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build and Test Commands
 
 ```bash
-# Build the library and proxy binary
-cargo build
+# Build the library and proxy binary (workspace)
+cargo build --workspace
 
 # Run all integration tests (requires Linux with user namespace support)
 cargo test --test socket_integration
@@ -60,16 +60,20 @@ IPC Reader/Writer Threads  ←──────────→  tap-tunnel-prox
                                             └─ Relays Ethernet frames
 ```
 
+### Workspace Structure
+
+- **`tap-tunnel`** (root): Main library crate
+- **`proxy/`**: Separate crate for the `tap-tunnel-proxy` binary
+
 ### Key Components
 
 - **`src/lib.rs`**: `Tunnel` and `TapConfig` API, proxy binary discovery/spawning, IPC thread setup
 - **`src/stack/mod.rs`**: smoltcp integration - `run_stack()` poll loop, `StackCommand` enum for socket operations, pending operation handling
 - **`src/stack/device.rs`**: `ProxyDevice` implementing smoltcp's `Device` trait over channels
 - **`src/socket/`**: `TcpStream` and `UdpSocket` async wrappers that send commands to the stack thread
-- **`src/bin/proxy.rs`**: Helper binary entry point, spawned in target namespace
-- **`src/proxy.rs`**: Frame relay between TAP device and parent process using `AsyncFd`
-- **`src/namespace.rs`**: `join_namespace(pid)` - joins user namespace first, then network namespace
-- **`src/tap.rs`**: TAP device creation via `/dev/net/tun` ioctl
+- **`proxy/src/main.rs`**: Proxy binary - joins target namespace, creates TAP device, relays Ethernet frames
+- **`proxy/src/namespace.rs`**: `join_namespace(pid)` - joins user namespace first, then network namespace
+- **`proxy/src/tap.rs`**: TAP device creation via `/dev/net/tun` ioctl
 
 ### Data Flow
 

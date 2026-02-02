@@ -1,22 +1,122 @@
-//! TAP proxy - relays raw Ethernet frames between TAP device and IPC socket.
+//! TAP proxy binary for tap-tunnel.
 //!
-//! This is a simplified frame relay with no protocol awareness.
-//! All protocol handling (Ethernet, ARP, IP, TCP, UDP) is done by smoltcp
-//! in the client library.
+//! This binary is spawned by the main library to run inside a target namespace.
+//! It joins the namespace BEFORE starting the tokio runtime, then relays
+//! raw Ethernet frames between the TAP device and the parent process.
+//!
+//! Usage:
+//!   tap-tunnel-proxy --pid <PID> --frame-fd <FD> [--tap-name <NAME>] [--tap-addr <IP/PREFIX>]
 
-use crate::TapConfig;
-use crate::tap::{bring_interface_up, configure_interface_ip, create_tap, get_interface_mac};
-use log::{debug, trace};
+use clap::Parser;
+use log::{debug, error, trace};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::net::Ipv4Addr;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use std::net::Ipv4Addr;
+mod namespace;
+mod tap;
+
+use namespace::join_namespace;
+use tap::{bring_interface_up, configure_interface_ip, create_tap, get_interface_mac};
+use tap_tunnel::TapConfig;
 
 /// Maximum Ethernet frame size (MTU 1500 + Ethernet header + some margin)
 const MAX_FRAME_SIZE: usize = 1522;
+
+#[derive(Parser, Debug)]
+#[command(name = "tap-tunnel-proxy")]
+#[command(about = "TAP proxy process for tap-tunnel namespace operations")]
+struct Args {
+    /// Target PID to join namespace of
+    #[arg(long)]
+    pid: u32,
+
+    /// File descriptor number for frame socket (Ethernet frame relay)
+    #[arg(long)]
+    frame_fd: i32,
+
+    /// TAP interface name
+    #[arg(long, default_value = "tap0")]
+    tap_name: String,
+
+    /// TAP interface address in IP/PREFIX format (optional)
+    #[arg(long)]
+    tap_addr: Option<String>,
+
+    /// Packet loss percentage for testing (0-100)
+    #[arg(long, default_value = "0")]
+    packet_loss: u8,
+}
+
+fn main() {
+    env_logger::init();
+
+    let args = Args::parse();
+
+    debug!(
+        "proxy starting: ns_pid={}, frame_fd={}, tap_name={}",
+        args.pid, args.frame_fd, args.tap_name,
+    );
+
+    // Join the target namespace BEFORE starting tokio
+    if let Err(e) = join_namespace(args.pid) {
+        error!("failed to join namespace: {}", e);
+        std::process::exit(1);
+    }
+    debug!("joined namespace of pid {}", args.pid);
+
+    // Take ownership of the inherited FD
+    let frame_fd = unsafe { OwnedFd::from_raw_fd(args.frame_fd) };
+
+    let config = build_tap_config(&args);
+
+    let result = run(frame_fd, config);
+
+    if let Err(e) = result {
+        error!("proxy error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn build_tap_config(args: &Args) -> TapConfig {
+    let mut config = TapConfig::new()
+        .interface_name(&args.tap_name)
+        .packet_loss_percent(args.packet_loss);
+
+    if let Some(addr_str) = &args.tap_addr {
+        if let Some((ip, prefix)) = parse_ip_prefix(addr_str) {
+            config = config.peer_addr(ip, prefix);
+        } else {
+            error!("invalid tap-addr format: {}", addr_str);
+        }
+    }
+
+    config
+}
+
+fn parse_ip_prefix(s: &str) -> Option<(Ipv4Addr, u8)> {
+    let parts: Vec<&str> = s.split('/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let ip: Ipv4Addr = parts[0].parse().ok()?;
+    let prefix: u8 = parts[1].parse().ok()?;
+
+    if prefix > 32 {
+        return None;
+    }
+
+    Some((ip, prefix))
+}
+
+fn run(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(run_proxy(frame_fd, config))
+}
 
 /// Build a gratuitous ARP reply frame.
 ///
@@ -167,7 +267,7 @@ impl AsyncWrite for AsyncFdIo {
 /// This creates a TAP interface and relays raw Ethernet frames unchanged
 /// between the TAP device and the parent process. Before starting the relay,
 /// it sends a gratuitous ARP to pre-fill the peer's ARP cache.
-pub async fn run_proxy(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
+async fn run_proxy(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
     debug!("TAP proxy starting");
 
     // Create TAP interface
@@ -241,36 +341,6 @@ async fn run_frame_relay(mut tap: AsyncFdIo, mut frame_socket: AsyncFdIo) -> io:
                 trace!("[PROXY] IPC → TAP: {} bytes", n);
                 tap.write_all(&sock_buf[..n]).await?;
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ipc::create_socketpair;
-
-    #[tokio::test]
-    async fn test_async_fd_io() {
-        let (parent_fd, child_fd) = create_socketpair().unwrap();
-        let mut parent = AsyncFdIo::new(parent_fd).unwrap();
-
-        let sample_pkt = vec![0, 1, 2, 3, 4, 5, 6, 7, 8];
-        let sample_pkt_len = sample_pkt.len();
-
-        tokio::spawn(async move {
-            for _ in 0..10 {
-                parent.write_all(&sample_pkt[..]).await.unwrap();
-                parent.write_all(&sample_pkt[..]).await.unwrap();
-            }
-        });
-
-        let mut child = AsyncFdIo::new(child_fd).unwrap();
-        let mut buf = [0u8; 64];
-
-        for _ in 0..10 {
-            let len = child.read(&mut buf[..]).await.unwrap();
-            assert_eq!(len, sample_pkt_len);
         }
     }
 }

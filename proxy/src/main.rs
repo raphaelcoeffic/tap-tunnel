@@ -1,8 +1,9 @@
 //! TAP proxy binary for tap-tunnel.
 //!
 //! This binary is spawned by the main library to run inside a target namespace.
-//! It joins the namespace BEFORE starting the tokio runtime, then relays
-//! raw Ethernet frames between the TAP device and the parent process.
+//! It joins the namespace BEFORE starting the tokio runtime, performs a protocol
+//! handshake with the client, then relays Ethernet frames between the TAP device
+//! and the parent process using the type-prefixed message protocol.
 //!
 //! Usage:
 //!   tap-tunnel-proxy --pid <PID> --frame-fd <FD> [--tap-name <NAME>] [--tap-addr <IP/PREFIX>]
@@ -29,6 +30,10 @@ mod tap;
 use ipc::{accept_seqpacket, create_seqpacket_listener};
 use namespace::join_namespace;
 use tap::{bring_interface_up, configure_interface_ip, create_tap, get_interface_mac};
+use tap_tunnel::protocol::{
+    ClientHello, Message, ProxyConfig, decode_control, decode_message, encode_control, encode_frame,
+    default_client_ip, validate_ip_in_subnet,
+};
 use tap_tunnel::TapConfig;
 
 /// Maximum Ethernet frame size (MTU 1500 + Ethernet header + some margin)
@@ -145,11 +150,15 @@ fn parse_ip_prefix(s: &str) -> Option<(Ipv4Addr, u8)> {
 }
 
 fn run(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
+    // Perform protocol handshake
+    let assigned_ip = perform_handshake(&frame_fd, &config)?;
+    debug!("handshake complete, assigned IP: {}", assigned_ip);
+
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run_proxy(frame_fd, config))
 }
 
-/// Run in socket-path mode: bind, listen, accept a connection, then run proxy.
+/// Run in socket-path mode: bind, listen, accept a connection, then run proxy with handshake.
 fn run_socket_path_mode(socket_path: &std::path::Path, config: TapConfig) -> io::Result<()> {
     debug!("binding to socket path: {:?}", socket_path);
     let listener = create_seqpacket_listener(socket_path)?;
@@ -161,7 +170,83 @@ fn run_socket_path_mode(socket_path: &std::path::Path, config: TapConfig) -> io:
     // Close the listener, we only need one connection
     drop(listener);
 
+    // run() handles handshake and protocol mode
     run(frame_fd, config)
+}
+
+/// Perform protocol handshake with client.
+fn perform_handshake(fd: &OwnedFd, config: &TapConfig) -> io::Result<Ipv4Addr> {
+    let raw_fd = fd.as_raw_fd();
+
+    // Receive ClientHello
+    let mut buf = [0u8; 1024];
+    let n = unsafe {
+        libc::read(raw_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+    };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "client closed connection during handshake",
+        ));
+    }
+
+    let msg = decode_message(&buf[..n as usize])?;
+    let hello: ClientHello = match msg {
+        Message::Control(payload) => decode_control(&payload)?,
+        Message::Frame(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected ClientHello, got frame",
+            ));
+        }
+    };
+    debug!("received ClientHello: {:?}", hello);
+
+    // Get TAP config
+    let (tap_ip, prefix_len) = config.peer_addr.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "tap_addr must be configured")
+    })?;
+
+    // Determine assigned IP
+    let assigned_ip = if let Some(requested) = hello.requested_ip {
+        // Validate requested IP is in subnet
+        if !validate_ip_in_subnet(requested, tap_ip, prefix_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("requested IP {} is not in subnet", requested),
+            ));
+        }
+        // Don't allow client to take the TAP IP
+        if requested == tap_ip {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "requested IP is the TAP interface IP",
+            ));
+        }
+        requested
+    } else {
+        default_client_ip(tap_ip)
+    };
+
+    // Send ProxyConfig
+    let proxy_config = ProxyConfig {
+        tap_ip,
+        prefix_len,
+        assigned_ip,
+    };
+    let config_msg = encode_control(&proxy_config)?;
+    let written = unsafe {
+        libc::write(raw_fd, config_msg.as_ptr() as *const libc::c_void, config_msg.len())
+    };
+    if written < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    debug!("sent ProxyConfig: {:?}", proxy_config);
+
+    Ok(assigned_ip)
 }
 
 /// Build a gratuitous ARP reply frame.
@@ -308,11 +393,7 @@ impl AsyncWrite for AsyncFdIo {
     }
 }
 
-/// Run the TAP proxy - pure frame relay between TAP and IPC socket.
-///
-/// This creates a TAP interface and relays raw Ethernet frames unchanged
-/// between the TAP device and the parent process. Before starting the relay,
-/// it sends a gratuitous ARP to pre-fill the peer's ARP cache.
+/// Run the TAP proxy with type-prefixed message protocol.
 async fn run_proxy(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
     debug!("TAP proxy starting");
 
@@ -341,30 +422,32 @@ async fn run_proxy(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
     let mut frame_socket = AsyncFdIo::new(frame_fd)?;
 
     // Send gratuitous ARP to pre-fill peer's ARP cache and signal readiness
+    // In protocol mode, we need to prefix with type byte
     if let Some((ip, _)) = config.peer_addr {
         let broadcast_mac = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
         let arp_frame = build_gratuitous_arp(tap_mac, ip, broadcast_mac);
-        frame_socket.write_all(&arp_frame).await?;
+        let msg = encode_frame(&arp_frame);
+        frame_socket.write_all(&msg).await?;
         debug!("sent gratuitous ARP for {}", ip);
     }
 
     // Wrap TAP in async wrapper
     let tap = AsyncFdIo::new(tap_fd)?;
 
-    // Run frame relay loop
+    // Run frame relay loop with protocol support
     run_frame_relay(tap, frame_socket).await
 }
 
-/// Run the frame relay loop - bidirectional Ethernet frame forwarding.
+/// Run the frame relay loop - bidirectional Ethernet frame forwarding with protocol.
 async fn run_frame_relay(mut tap: AsyncFdIo, mut frame_socket: AsyncFdIo) -> io::Result<()> {
     let mut tap_buf = vec![0u8; MAX_FRAME_SIZE];
-    let mut sock_buf = vec![0u8; MAX_FRAME_SIZE];
+    let mut sock_buf = vec![0u8; MAX_FRAME_SIZE + 1]; // Extra byte for type prefix
 
     debug!("[PROXY] frame relay starting");
 
     loop {
         tokio::select! {
-            // TAP → IPC: Forward raw Ethernet frame unchanged
+            // TAP → IPC: Forward Ethernet frame with type prefix
             result = tap.read(&mut tap_buf) => {
                 let n = result?;
                 if n == 0 {
@@ -372,11 +455,13 @@ async fn run_frame_relay(mut tap: AsyncFdIo, mut frame_socket: AsyncFdIo) -> io:
                     return Ok(());
                 }
 
-                trace!("[PROXY] TAP → IPC: {} bytes", n);
-                frame_socket.write_all(&tap_buf[..n]).await?;
+                // Encode frame with type prefix
+                let msg = encode_frame(&tap_buf[..n]);
+                trace!("[PROXY] TAP → IPC: {} bytes (frame: {})", msg.len(), n);
+                frame_socket.write_all(&msg).await?;
             }
 
-            // IPC → TAP: Forward raw Ethernet frame unchanged
+            // IPC → TAP: Decode message and forward frame
             result = frame_socket.read(&mut sock_buf) => {
                 let n = result?;
                 if n == 0 {
@@ -384,9 +469,21 @@ async fn run_frame_relay(mut tap: AsyncFdIo, mut frame_socket: AsyncFdIo) -> io:
                     return Ok(());
                 }
 
-                trace!("[PROXY] IPC → TAP: {} bytes", n);
-                tap.write_all(&sock_buf[..n]).await?;
+                // Decode message
+                match decode_message(&sock_buf[..n]) {
+                    Ok(Message::Frame(frame)) => {
+                        trace!("[PROXY] IPC → TAP: {} bytes", frame.len());
+                        tap.write_all(&frame).await?;
+                    }
+                    Ok(Message::Control(payload)) => {
+                        debug!("[PROXY] ignoring control message: {} bytes", payload.len());
+                    }
+                    Err(e) => {
+                        debug!("[PROXY] decode error: {}", e);
+                    }
+                }
             }
         }
     }
 }
+

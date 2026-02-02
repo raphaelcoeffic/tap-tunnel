@@ -18,6 +18,8 @@ log = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "time", "sync"] }
 smoltcp = { version = "0.12", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "alloc", "log"] }
 crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [dev-dependencies]
 env_logger = { workspace = true }

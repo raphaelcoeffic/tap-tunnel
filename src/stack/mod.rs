@@ -18,25 +18,29 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndp
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
+use tokio::sync::oneshot;
+
+type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
 
 /// Commands sent from async socket handles to the stack thread.
 pub enum StackCommand {
     /// Create a TCP socket and initiate connection.
     TcpConnect {
         addr: SocketAddr,
-        response: tokio::sync::oneshot::Sender<io::Result<SocketHandle>>,
+        response: ResponseSender<SocketHandle>,
     },
     /// Create a TCP listener and bind to the given address.
     TcpListen {
         addr: SocketAddr,
         backlog: usize,
-        response: tokio::sync::oneshot::Sender<io::Result<(SocketHandle, SocketAddr)>>,
+        response: ResponseSender<(SocketHandle, SocketAddr)>,
     },
     /// Accept an incoming connection on a TCP listener.
     TcpAccept {
         handle: SocketHandle,
-        response: tokio::sync::oneshot::Sender<io::Result<(SocketHandle, SocketAddr)>>,
+        response: ResponseSender<(SocketHandle, SocketAddr)>,
     },
     /// Close a TCP listener and all its pending sockets.
     TcpListenerClose { handle: SocketHandle },
@@ -44,32 +48,32 @@ pub enum StackCommand {
     TcpSend {
         handle: SocketHandle,
         data: Vec<u8>,
-        response: tokio::sync::oneshot::Sender<io::Result<usize>>,
+        response: ResponseSender<usize>,
     },
     /// Receive data from a TCP socket.
     TcpRecv {
         handle: SocketHandle,
         max_len: usize,
-        response: tokio::sync::oneshot::Sender<io::Result<Vec<u8>>>,
+        response: ResponseSender<Vec<u8>>,
     },
     /// Close a TCP socket.
     TcpClose { handle: SocketHandle },
     /// Bind a UDP socket.
     UdpBind {
         addr: SocketAddr,
-        response: tokio::sync::oneshot::Sender<io::Result<SocketHandle>>,
+        response: ResponseSender<SocketHandle>,
     },
     /// Send data on a UDP socket.
     UdpSend {
         handle: SocketHandle,
         dest: SocketAddr,
         data: Vec<u8>,
-        response: tokio::sync::oneshot::Sender<io::Result<usize>>,
+        response: ResponseSender<usize>,
     },
     /// Receive data from a UDP socket.
     UdpRecv {
         handle: SocketHandle,
-        response: tokio::sync::oneshot::Sender<io::Result<(Vec<u8>, SocketAddr)>>,
+        response: ResponseSender<(Vec<u8>, SocketAddr)>,
     },
     /// Close a UDP socket.
     UdpClose { handle: SocketHandle },
@@ -79,28 +83,24 @@ pub enum StackCommand {
 
 /// Pending operations waiting for socket state changes.
 enum PendingOp {
-    TcpConnect(tokio::sync::oneshot::Sender<io::Result<SocketHandle>>),
-    TcpAccept(tokio::sync::oneshot::Sender<io::Result<(SocketHandle, SocketAddr)>>),
+    TcpConnect(ResponseSender<SocketHandle>),
+    TcpAccept(ResponseSender<(SocketHandle, SocketAddr)>),
     TcpSend {
         data: Vec<u8>,
         offset: usize,
-        response: tokio::sync::oneshot::Sender<io::Result<usize>>,
+        response: ResponseSender<usize>,
     },
     TcpRecv {
         max_len: usize,
-        response: tokio::sync::oneshot::Sender<io::Result<Vec<u8>>>,
+        response: ResponseSender<Vec<u8>>,
     },
-    UdpRecv(tokio::sync::oneshot::Sender<io::Result<(Vec<u8>, SocketAddr)>>),
+    UdpRecv(ResponseSender<(Vec<u8>, SocketAddr)>),
 }
 
 /// State for a TCP listener managing multiple listening sockets for backlog.
 struct ListenerState {
     /// The address this listener is bound to.
     addr: SocketAddr,
-    /// Desired number of listening sockets (backlog).
-    /// Currently stored for potential future use (e.g., dynamic backlog adjustment).
-    #[allow(dead_code)]
-    backlog: usize,
     /// Socket handles currently in Listen state.
     listening_handles: Vec<SocketHandle>,
 }
@@ -272,7 +272,7 @@ fn handle_tcp_connect(
     sockets: &mut SocketSet<'_>,
     pending: &mut HashMap<SocketHandle, PendingOp>,
     config: &StackConfig,
-    response: tokio::sync::oneshot::Sender<io::Result<SocketHandle>>,
+    response: oneshot::Sender<io::Result<SocketHandle>>,
 ) {
     debug!("tcp_connect to {}", addr);
 
@@ -316,7 +316,7 @@ fn handle_tcp_listen(
     backlog: usize,
     sockets: &mut SocketSet<'_>,
     listeners: &mut HashMap<SocketHandle, ListenerState>,
-    response: tokio::sync::oneshot::Sender<io::Result<(SocketHandle, SocketAddr)>>,
+    response: oneshot::Sender<io::Result<(SocketHandle, SocketAddr)>>,
 ) {
     debug!("tcp_listen on {} with backlog {}", addr, backlog);
 
@@ -393,7 +393,6 @@ fn handle_tcp_listen(
         primary_handle,
         ListenerState {
             addr,
-            backlog,
             listening_handles,
         },
     );
@@ -410,7 +409,7 @@ fn handle_tcp_accept(
     sockets: &mut SocketSet<'_>,
     listeners: &mut HashMap<SocketHandle, ListenerState>,
     pending: &mut HashMap<SocketHandle, PendingOp>,
-    response: tokio::sync::oneshot::Sender<io::Result<(SocketHandle, SocketAddr)>>,
+    response: ResponseSender<(SocketHandle, SocketAddr)>,
 ) {
     trace!("tcp_accept on handle={:?}", handle);
 
@@ -537,7 +536,7 @@ fn handle_tcp_send(
     data: Vec<u8>,
     sockets: &mut SocketSet<'_>,
     pending: &mut HashMap<SocketHandle, PendingOp>,
-    response: tokio::sync::oneshot::Sender<io::Result<usize>>,
+    response: ResponseSender<usize>,
 ) {
     trace!("tcp_send: {} bytes", data.len());
     let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -589,7 +588,7 @@ fn handle_tcp_recv(
     max_len: usize,
     sockets: &mut SocketSet<'_>,
     pending: &mut HashMap<SocketHandle, PendingOp>,
-    response: tokio::sync::oneshot::Sender<io::Result<Vec<u8>>>,
+    response: ResponseSender<Vec<u8>>,
 ) {
     trace!("tcp_recv: max_len={}", max_len);
     let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -636,7 +635,7 @@ fn handle_tcp_close(
 fn handle_udp_bind(
     addr: SocketAddr,
     sockets: &mut SocketSet<'_>,
-    response: tokio::sync::oneshot::Sender<io::Result<SocketHandle>>,
+    response: ResponseSender<SocketHandle>,
 ) {
     debug!("udp_bind: addr={}", addr);
 
@@ -692,7 +691,7 @@ fn handle_udp_send(
     dest: SocketAddr,
     data: Vec<u8>,
     sockets: &mut SocketSet<'_>,
-    response: tokio::sync::oneshot::Sender<io::Result<usize>>,
+    response: ResponseSender<usize>,
 ) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
     let endpoint = socket_addr_to_endpoint(dest);
@@ -711,7 +710,7 @@ fn handle_udp_recv(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     pending: &mut HashMap<SocketHandle, PendingOp>,
-    response: tokio::sync::oneshot::Sender<io::Result<(Vec<u8>, SocketAddr)>>,
+    response: ResponseSender<(Vec<u8>, SocketAddr)>,
 ) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
 
@@ -924,8 +923,8 @@ fn endpoint_to_socket_addr(endpoint: IpEndpoint) -> SocketAddr {
     }
 }
 
-static EPHEMERAL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(49152);
+static EPHEMERAL_PORT: atomic::AtomicU16 = atomic::AtomicU16::new(49152);
 
 fn allocate_ephemeral_port() -> u16 {
-    EPHEMERAL_PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    EPHEMERAL_PORT.fetch_add(1, atomic::Ordering::Relaxed)
 }

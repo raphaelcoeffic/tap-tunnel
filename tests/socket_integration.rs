@@ -617,13 +617,9 @@ async fn test_socket_path_mode_tcp() {
     // Give proxy a moment to start listening
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Connect to proxy via socket path
-    let config = TapConfig::new()
-        .interface_name("tap0")
-        .peer_addr(PEER_IP, PREFIX_LEN)
-        .local_addr(LOCAL_IP, PREFIX_LEN);
-
-    let tunnel = Tunnel::connect_to(&socket_path, config)
+    // Connect to proxy via socket path with auto-configuration
+    // The new API performs handshake and receives IP config from proxy
+    let tunnel = Tunnel::connect_to(&socket_path, None)
         .await
         .expect("failed to connect to proxy via socket path");
 
@@ -645,6 +641,60 @@ async fn test_socket_path_mode_tcp() {
     assert_eq!(&buf[..n], b"socket-path mode works!\n");
 
     // Clean up socket
+    let _ = std::fs::remove_file(&socket_path);
+}
+
+#[tokio::test]
+async fn test_socket_path_mode_requested_ip() {
+    use std::path::Path;
+
+    // Use a unique socket path
+    let socket_path = format!("/tmp/tap-tunnel-test-reqip-{}.sock", std::process::id());
+    let _ = std::fs::remove_file(&socket_path);
+
+    // Create a namespace with a TCP echo server
+    let ns_proc = tcp_echo_server_ns(18101).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Start proxy in socket-path mode
+    let _proxy =
+        ProxyProcess::new(pid, &socket_path).expect("failed to start proxy in socket-path mode");
+
+    // Wait for socket to be created
+    for _ in 0..50 {
+        if Path::new(&socket_path).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect with a requested IP
+    let requested_ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+    let tunnel = Tunnel::connect_to(&socket_path, Some(requested_ip))
+        .await
+        .expect("failed to connect with requested IP");
+
+    // Connect to the TCP server
+    let server_addr = format!("{}:18101", PEER_IP).parse().unwrap();
+    let stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    // Send and receive data
+    stream
+        .write_all(b"requested IP works!\n")
+        .await
+        .expect("write failed");
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"requested IP works!\n");
+
     let _ = std::fs::remove_file(&socket_path);
 }
 

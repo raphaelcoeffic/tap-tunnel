@@ -143,7 +143,8 @@ TapConfig::new()
 ## Container / Socket Path Mode
 
 When the proxy runs inside a container, you can use socket-path mode to establish a connection.
-The proxy binds to a Unix socket, and the library connects to it.
+The proxy binds to a Unix socket, and the library connects to it. IP configuration is
+exchanged automatically during connection handshake.
 
 ```bash
 # Inside container: Proxy binds and waits for connection
@@ -154,20 +155,26 @@ tap-tunnel-proxy --socket-path /shared/frame.sock --tap-addr 10.0.0.1/24
 ```
 
 ```rust
-use tap_tunnel::{TapConfig, Tunnel};
+use tap_tunnel::Tunnel;
 use std::net::Ipv4Addr;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let config = TapConfig::new()
-        .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24)
-        .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24);
+    // Connect with automatic IP assignment (proxy assigns 10.0.0.2)
+    let tunnel = Tunnel::connect_to("/shared/frame.sock", None).await?;
 
-    // Connect to the proxy's socket (mounted from container)
-    let tunnel = Tunnel::connect_to("/shared/frame.sock", config).await?;
+    // Or request a specific IP
+    let tunnel = Tunnel::connect_to(
+        "/shared/frame.sock",
+        Some(Ipv4Addr::new(10, 0, 0, 5))
+    ).await?;
 
     // Use TCP/UDP as normal
     let mut tcp = tunnel.tcp_connect("10.0.0.1:8080".parse().unwrap()).await?;
     Ok(())
 }
 ```
+
+The handshake protocol exchanges:
+- **ClientHello**: Optional requested IP address
+- **ProxyConfig**: TAP IP, prefix length, and assigned client IP

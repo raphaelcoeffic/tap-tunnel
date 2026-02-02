@@ -58,6 +58,7 @@
 //! ```
 
 pub(crate) mod ipc;
+pub mod protocol;
 pub mod socket;
 mod stack;
 
@@ -348,11 +349,51 @@ impl Tunnel {
 
     /// Synchronous version of connect_with_config.
     pub fn connect_with_config_blocking(pid: u32, mut config: TapConfig) -> io::Result<Self> {
+        use protocol::{ClientHello, ProxyConfig, decode_control, decode_message, encode_control, Message};
+        use std::io::{Read, Write};
+
         // Create socketpair for frame relay (SEQPACKET for message boundaries)
         let (parent_fd, child_fd) = ipc::create_socketpair()?;
 
         // Spawn the proxy process
         let proxy_child = spawn_proxy(pid, child_fd, &config)?;
+
+        // Convert to UnixStream for handshake
+        let mut stream = fd_to_unix_stream(parent_fd)?;
+
+        // Send ClientHello - request the local_addr if configured, otherwise let proxy assign
+        let requested_ip = config.local_addr.map(|(ip, _)| ip);
+        let hello = ClientHello { requested_ip };
+        let hello_msg = encode_control(&hello)?;
+        stream.write_all(&hello_msg)?;
+        debug!("sent ClientHello: {:?}", hello);
+
+        // Receive ProxyConfig
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "proxy closed connection during handshake",
+            ));
+        }
+
+        let msg = decode_message(&buf[..n])?;
+        let proxy_config: ProxyConfig = match msg {
+            Message::Control(payload) => decode_control(&payload)?,
+            Message::Frame(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected ProxyConfig, got frame",
+                ));
+            }
+        };
+        debug!("received ProxyConfig: {:?}", proxy_config);
+
+        // Update config with values from proxy
+        config = config
+            .peer_addr(proxy_config.tap_ip, proxy_config.prefix_len)
+            .local_addr(proxy_config.assigned_ip, proxy_config.prefix_len);
 
         // Use PID-based MAC if not explicitly set
         if config.mac.is_none() {
@@ -361,52 +402,108 @@ impl Tunnel {
             config.mac = Some(mac);
         }
 
-        Self::setup_stack_from_fd(parent_fd, config, Some(proxy_child))
+        // Get the FD back from the stream
+        let frame_fd = {
+            use std::os::fd::IntoRawFd;
+            let raw_fd = stream.into_raw_fd();
+            unsafe { OwnedFd::from_raw_fd(raw_fd) }
+        };
+
+        Self::setup_stack_from_fd(frame_fd, config, Some(proxy_child))
     }
 
     /// Connect to a proxy already listening on the given Unix socket path.
     ///
-    /// This is useful when the proxy is running inside a container and the
-    /// socket is mounted into the host filesystem. The proxy should be started
-    /// with `--socket-path` before calling this method.
+    /// This performs a handshake with the proxy to receive IP configuration
+    /// automatically. If `requested_ip` is provided, the proxy will try to
+    /// assign that IP; otherwise it assigns one automatically.
     ///
     /// # Example
     ///
     /// ```no_run
-    /// use tap_tunnel::{TapConfig, Tunnel};
+    /// use tap_tunnel::Tunnel;
     /// use std::net::Ipv4Addr;
     ///
     /// # async fn example() -> std::io::Result<()> {
-    /// let config = TapConfig::new()
-    ///     .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24)
-    ///     .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24);
-    /// let tunnel = Tunnel::connect_to("/tmp/tunnel/frame.sock", config).await?;
+    /// // Auto-assign IP
+    /// let tunnel = Tunnel::connect_to("/tmp/tunnel.sock", None).await?;
+    ///
+    /// // Request specific IP
+    /// let tunnel = Tunnel::connect_to("/tmp/tunnel.sock", Some(Ipv4Addr::new(10, 0, 0, 5))).await?;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn connect_to(
         socket_path: impl AsRef<Path>,
-        config: TapConfig,
+        requested_ip: Option<Ipv4Addr>,
     ) -> io::Result<Self> {
-        Self::connect_to_blocking(socket_path, config)
+        Self::connect_to_blocking(socket_path, requested_ip)
     }
 
     /// Synchronous version of `connect_to`.
     pub fn connect_to_blocking(
         socket_path: impl AsRef<Path>,
-        config: TapConfig,
+        requested_ip: Option<Ipv4Addr>,
     ) -> io::Result<Self> {
+        use protocol::{ClientHello, ProxyConfig, decode_control, decode_message, encode_control, Message};
+        use std::io::{Read, Write};
+
         let socket_path = socket_path.as_ref();
 
         // Connect to the proxy's listening socket
         let frame_fd = ipc::connect_seqpacket(socket_path)?;
         debug!("connected to proxy at {:?}", socket_path);
 
-        // Set up the stack (shared code with connect_with_config_blocking)
+        // Convert to UnixStream for handshake
+        let mut stream = fd_to_unix_stream(frame_fd)?;
+
+        // Send ClientHello
+        let hello = ClientHello { requested_ip };
+        let hello_msg = encode_control(&hello)?;
+        stream.write_all(&hello_msg)?;
+        debug!("sent ClientHello: {:?}", hello);
+
+        // Receive ProxyConfig
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "proxy closed connection during handshake",
+            ));
+        }
+
+        let msg = decode_message(&buf[..n])?;
+        let proxy_config: ProxyConfig = match msg {
+            Message::Control(payload) => decode_control(&payload)?,
+            Message::Frame(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected ProxyConfig, got frame",
+                ));
+            }
+        };
+        debug!("received ProxyConfig: {:?}", proxy_config);
+
+        // Build TapConfig from received config
+        let config = TapConfig::new()
+            .peer_addr(proxy_config.tap_ip, proxy_config.prefix_len)
+            .local_addr(proxy_config.assigned_ip, proxy_config.prefix_len);
+
+        // Get the FD back from the stream
+        let frame_fd = {
+            use std::os::fd::IntoRawFd;
+            let raw_fd = stream.into_raw_fd();
+            unsafe { OwnedFd::from_raw_fd(raw_fd) }
+        };
+
+        // Set up the stack with protocol-aware IPC
         Self::setup_stack_from_fd(frame_fd, config, None)
     }
 
     /// Common setup code: given a connected frame FD, set up channels, IPC threads, and stack.
+    ///
+    /// Messages are prefixed with a type byte (0x00=control, 0x01=frame).
     fn setup_stack_from_fd(
         frame_fd: OwnedFd,
         config: TapConfig,
@@ -423,9 +520,7 @@ impl Tunnel {
 
         // Generate MAC address
         let mac = config.mac.unwrap_or_else(|| {
-            // Generate a locally administered unicast MAC
             let mut mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-            // Use random byte for uniqueness when no PID available
             mac[5] = (std::process::id() & 0xff) as u8;
             mac
         });
@@ -451,8 +546,9 @@ impl Tunnel {
 
         // Spawn IPC reader thread (proxy -> stack)
         let ipc_reader_thread = std::thread::spawn(move || {
+            use protocol::{decode_message, Message};
             debug!("[IPC-RX] reader thread starting");
-            let mut buf = [0u8; 1522];
+            let mut buf = [0u8; 1600];
             loop {
                 use std::io::Read;
                 match (&ipc_read_stream).read(&mut buf) {
@@ -460,46 +556,39 @@ impl Tunnel {
                         debug!("[IPC-RX] proxy closed connection");
                         break;
                     }
-                    Ok(n) => {
-                        debug!("[IPC-RX] read {} bytes, sending to stack", n);
-                        if frame_tx.send(buf[..n].to_vec()).is_err() {
-                            debug!("[IPC-RX] stack channel closed");
-                            break;
+                    Ok(n) => match decode_message(&buf[..n]) {
+                        Ok(Message::Frame(frame)) => {
+                            if frame_tx.send(frame).is_err() {
+                                break;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        debug!("[IPC-RX] error: {}", e);
-                        break;
-                    }
+                        Ok(Message::Control(_)) => {} // Ignore post-handshake control
+                        Err(_) => {}                  // Ignore decode errors
+                    },
+                    Err(_) => break,
                 }
             }
-            debug!("[IPC-RX] reader thread exiting");
         });
 
         // Spawn IPC writer thread (stack -> proxy)
         std::thread::spawn(move || {
-            use std::io::Write;
+            use protocol::encode_frame;
             debug!("[IPC-TX] writer thread starting");
             loop {
+                use std::io::Write;
                 match frame_to_proxy_rx.recv() {
                     Ok(frame) => {
-                        debug!("[IPC-TX] sending {} bytes to proxy", frame.len());
-                        if let Err(e) = (&ipc_write_stream).write_all(&frame) {
-                            debug!("[IPC-TX] write error: {}", e);
+                        let msg = encode_frame(&frame);
+                        if (&ipc_write_stream).write_all(&msg).is_err() {
                             break;
                         }
-                        debug!("[IPC-TX] sent successfully");
                     }
-                    Err(_) => {
-                        debug!("[IPC-TX] stack channel closed");
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
-            debug!("[IPC-TX] writer thread exiting");
         });
 
-        // Create device for smoltcp (wrap in FaultInjector for packet loss simulation)
+        // Create device for smoltcp
         let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, 1514);
         let mut device = FaultInjector::new(device, random_seed());
         device.set_drop_chance(config.packet_loss_percent);

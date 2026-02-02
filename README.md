@@ -129,3 +129,35 @@ TapConfig::new()
     .interface_name("tap0")                // TAP interface name (default: "tap0")
     .address(Ipv4Addr::new(10, 0, 0, 1), 24)  // Configure IP on the interface
 ```
+
+## Container / Socket Path Mode
+
+When the proxy runs inside a container, you can use socket-path mode to establish a connection.
+The proxy binds to a Unix socket, and the library connects to it.
+
+```bash
+# Inside container: Proxy binds and waits for connection
+# No --pid needed when already running in the target namespace
+tap-tunnel-proxy --socket-path /shared/frame.sock --tap-addr 10.0.0.1/24
+
+# On host: Library connects to the socket
+```
+
+```rust
+use tap_tunnel::{TapConfig, Tunnel};
+use std::net::Ipv4Addr;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let config = TapConfig::new()
+        .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24)
+        .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24);
+
+    // Connect to the proxy's socket (mounted from container)
+    let tunnel = Tunnel::connect_to("/shared/frame.sock", config).await?;
+
+    // Use TCP/UDP as normal
+    let mut tcp = tunnel.tcp_connect("10.0.0.1:8080".parse().unwrap()).await?;
+    Ok(())
+}
+```

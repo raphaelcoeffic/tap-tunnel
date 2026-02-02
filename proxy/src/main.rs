@@ -6,19 +6,27 @@
 //!
 //! Usage:
 //!   tap-tunnel-proxy --pid <PID> --frame-fd <FD> [--tap-name <NAME>] [--tap-addr <IP/PREFIX>]
+//!   tap-tunnel-proxy --pid <PID> --socket-path <PATH> [--tap-name <NAME>] [--tap-addr <IP/PREFIX>]
+//!   tap-tunnel-proxy --socket-path <PATH> [--tap-name <NAME>] [--tap-addr <IP/PREFIX>]
+//!
+//! When --pid is omitted, the proxy assumes it's already running in the target namespace
+//! (e.g., started directly inside a container).
 
 use clap::Parser;
 use log::{debug, error, trace};
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::pin::Pin;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+mod ipc;
 mod namespace;
 mod tap;
 
+use ipc::{accept_seqpacket, create_seqpacket_listener};
 use namespace::join_namespace;
 use tap::{bring_interface_up, configure_interface_ip, create_tap, get_interface_mac};
 use tap_tunnel::TapConfig;
@@ -30,13 +38,20 @@ const MAX_FRAME_SIZE: usize = 1522;
 #[command(name = "tap-tunnel-proxy")]
 #[command(about = "TAP proxy process for tap-tunnel namespace operations")]
 struct Args {
-    /// Target PID to join namespace of
+    /// Target PID to join namespace of.
+    /// If omitted, assumes already running in the target namespace.
     #[arg(long)]
-    pid: u32,
+    pid: Option<u32>,
 
     /// File descriptor number for frame socket (Ethernet frame relay)
-    #[arg(long)]
-    frame_fd: i32,
+    /// Mutually exclusive with --socket-path
+    #[arg(long, conflicts_with = "socket_path")]
+    frame_fd: Option<i32>,
+
+    /// Unix socket path to listen on for frame relay
+    /// Mutually exclusive with --frame-fd
+    #[arg(long, conflicts_with = "frame_fd")]
+    socket_path: Option<PathBuf>,
 
     /// TAP interface name
     #[arg(long, default_value = "tap0")]
@@ -56,24 +71,40 @@ fn main() {
 
     let args = Args::parse();
 
-    debug!(
-        "proxy starting: ns_pid={}, frame_fd={}, tap_name={}",
-        args.pid, args.frame_fd, args.tap_name,
-    );
-
-    // Join the target namespace BEFORE starting tokio
-    if let Err(e) = join_namespace(args.pid) {
-        error!("failed to join namespace: {}", e);
+    // Validate that exactly one of frame_fd or socket_path is provided
+    if args.frame_fd.is_none() && args.socket_path.is_none() {
+        error!("either --frame-fd or --socket-path must be specified");
         std::process::exit(1);
     }
-    debug!("joined namespace of pid {}", args.pid);
 
-    // Take ownership of the inherited FD
-    let frame_fd = unsafe { OwnedFd::from_raw_fd(args.frame_fd) };
+    debug!(
+        "proxy starting: pid={:?}, frame_fd={:?}, socket_path={:?}, tap_name={}",
+        args.pid, args.frame_fd, args.socket_path, args.tap_name,
+    );
+
+    // Join the target namespace BEFORE starting tokio (if PID provided)
+    if let Some(pid) = args.pid {
+        if let Err(e) = join_namespace(pid) {
+            error!("failed to join namespace: {}", e);
+            std::process::exit(1);
+        }
+        debug!("joined namespace of pid {}", pid);
+    } else {
+        debug!("no --pid specified, assuming already in target namespace");
+    }
 
     let config = build_tap_config(&args);
 
-    let result = run(frame_fd, config);
+    let result = if let Some(fd) = args.frame_fd {
+        // Take ownership of the inherited FD
+        let frame_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        run(frame_fd, config)
+    } else if let Some(socket_path) = args.socket_path {
+        // Socket-path mode: bind, listen, accept, then run
+        run_socket_path_mode(&socket_path, config)
+    } else {
+        unreachable!()
+    };
 
     if let Err(e) = result {
         error!("proxy error: {}", e);
@@ -116,6 +147,21 @@ fn parse_ip_prefix(s: &str) -> Option<(Ipv4Addr, u8)> {
 fn run(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run_proxy(frame_fd, config))
+}
+
+/// Run in socket-path mode: bind, listen, accept a connection, then run proxy.
+fn run_socket_path_mode(socket_path: &std::path::Path, config: TapConfig) -> io::Result<()> {
+    debug!("binding to socket path: {:?}", socket_path);
+    let listener = create_seqpacket_listener(socket_path)?;
+    debug!("listening for connection on {:?}", socket_path);
+
+    let frame_fd = accept_seqpacket(&listener)?;
+    debug!("accepted connection");
+
+    // Close the listener, we only need one connection
+    drop(listener);
+
+    run(frame_fd, config)
 }
 
 /// Build a gratuitous ARP reply frame.

@@ -49,15 +49,9 @@ impl UserNetNamespace {
         let mut cmd = Command::new("unshare");
         cmd.args(["--user", "--net", "--map-root-user", "sh", "-c", script])
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Create a new process group so we can kill all children
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setpgid(0, 0);
-                Ok(())
-            });
-        }
+            .stderr(Stdio::piped())
+            // Create a new process group so we can kill all children
+            .process_group(0);
         let mut child = cmd.spawn()?;
         let pid = child.id();
 
@@ -459,4 +453,116 @@ async fn test_udp_multiple_messages() {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert_eq!(response, format!("echo: msg {}", i));
     }
+}
+
+// ============================================================================
+// Socket-Path Mode Tests
+// ============================================================================
+
+/// Helper struct to manage the proxy process started with --socket-path
+struct ProxyProcess {
+    child: Child,
+}
+
+impl ProxyProcess {
+    fn new(target_pid: u32, socket_path: &str) -> std::io::Result<Self> {
+        // Find the proxy binary
+        let proxy_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("tap-tunnel-proxy")))
+            .filter(|p| p.exists())
+            .unwrap_or_else(|| std::path::PathBuf::from("target/debug/tap-tunnel-proxy"));
+
+        let mut cmd = Command::new(&proxy_path);
+        cmd.args([
+            "--pid",
+            &target_pid.to_string(),
+            "--socket-path",
+            socket_path,
+            "--tap-addr",
+            "10.0.0.1/24",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Create a new process group so we can kill all children
+        .process_group(0);
+
+        let child = cmd.spawn()?;
+        Ok(Self { child })
+    }
+}
+
+impl Drop for ProxyProcess {
+    fn drop(&mut self) {
+        kill_process_tree(&mut self.child);
+    }
+}
+
+#[tokio::test]
+async fn test_socket_path_mode_tcp() {
+    use std::path::Path;
+
+    // Use a unique socket path in /tmp
+    let socket_path = format!("/tmp/tap-tunnel-test-{}.sock", std::process::id());
+
+    // Clean up any existing socket
+    let _ = std::fs::remove_file(&socket_path);
+
+    // First, create a namespace with a TCP echo server
+    let ns_proc = tcp_echo_server_ns(18100).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    // Give the server time to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Start proxy in socket-path mode, pointing to the namespace
+    let _proxy = ProxyProcess::new(pid, &socket_path)
+        .expect("failed to start proxy in socket-path mode");
+
+    // Wait for socket to be created
+    for _ in 0..50 {
+        if Path::new(&socket_path).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        Path::new(&socket_path).exists(),
+        "socket path not created: {}",
+        socket_path
+    );
+
+    // Give proxy a moment to start listening
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Connect to proxy via socket path
+    let config = TapConfig::new()
+        .interface_name("tap0")
+        .peer_addr(PEER_IP, PREFIX_LEN)
+        .local_addr(LOCAL_IP, PREFIX_LEN);
+
+    let tunnel = Tunnel::connect_to(&socket_path, config)
+        .await
+        .expect("failed to connect to proxy via socket path");
+
+    // Connect to the TCP server
+    let server_addr = format!("{}:18100", PEER_IP).parse().unwrap();
+    let stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    // Send and receive data
+    stream
+        .write_all(b"socket-path mode works!\n")
+        .await
+        .expect("write failed");
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"socket-path mode works!\n");
+
+    // Clean up socket
+    let _ = std::fs::remove_file(&socket_path);
 }

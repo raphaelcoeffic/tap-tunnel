@@ -70,6 +70,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -167,8 +168,8 @@ pub struct Tunnel {
 struct TunnelInner {
     /// Channel to send commands to the stack thread
     commands: Sender<StackCommand>,
-    /// TAP proxy child process
-    proxy_child: Mutex<Child>,
+    /// TAP proxy child process (None when using socket-path mode)
+    proxy_child: Mutex<Option<Child>>,
     /// Stack thread handle
     stack_thread: Mutex<Option<JoinHandle<()>>>,
     /// IPC reader thread handle
@@ -194,8 +195,10 @@ impl Drop for TunnelInner {
             let _ = h.join();
         }
 
-        // Clean up proxy process
-        if let Ok(mut child) = self.proxy_child.lock() {
+        // Clean up proxy process (if we spawned one)
+        if let Ok(mut guard) = self.proxy_child.lock()
+            && let Some(ref mut child) = *guard
+        {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -344,27 +347,86 @@ impl Tunnel {
     }
 
     /// Synchronous version of connect_with_config.
-    pub fn connect_with_config_blocking(pid: u32, config: TapConfig) -> io::Result<Self> {
+    pub fn connect_with_config_blocking(pid: u32, mut config: TapConfig) -> io::Result<Self> {
         // Create socketpair for frame relay (SEQPACKET for message boundaries)
         let (parent_fd, child_fd) = ipc::create_socketpair()?;
 
         // Spawn the proxy process
         let proxy_child = spawn_proxy(pid, child_fd, &config)?;
 
+        // Use PID-based MAC if not explicitly set
+        if config.mac.is_none() {
+            let mut mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+            mac[5] = (pid & 0xff) as u8;
+            config.mac = Some(mac);
+        }
+
+        Self::setup_stack_from_fd(parent_fd, config, Some(proxy_child))
+    }
+
+    /// Connect to a proxy already listening on the given Unix socket path.
+    ///
+    /// This is useful when the proxy is running inside a container and the
+    /// socket is mounted into the host filesystem. The proxy should be started
+    /// with `--socket-path` before calling this method.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use tap_tunnel::{TapConfig, Tunnel};
+    /// use std::net::Ipv4Addr;
+    ///
+    /// # async fn example() -> std::io::Result<()> {
+    /// let config = TapConfig::new()
+    ///     .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24)
+    ///     .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24);
+    /// let tunnel = Tunnel::connect_to("/tmp/tunnel/frame.sock", config).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn connect_to(
+        socket_path: impl AsRef<Path>,
+        config: TapConfig,
+    ) -> io::Result<Self> {
+        Self::connect_to_blocking(socket_path, config)
+    }
+
+    /// Synchronous version of `connect_to`.
+    pub fn connect_to_blocking(
+        socket_path: impl AsRef<Path>,
+        config: TapConfig,
+    ) -> io::Result<Self> {
+        let socket_path = socket_path.as_ref();
+
+        // Connect to the proxy's listening socket
+        let frame_fd = ipc::connect_seqpacket(socket_path)?;
+        debug!("connected to proxy at {:?}", socket_path);
+
+        // Set up the stack (shared code with connect_with_config_blocking)
+        Self::setup_stack_from_fd(frame_fd, config, None)
+    }
+
+    /// Common setup code: given a connected frame FD, set up channels, IPC threads, and stack.
+    fn setup_stack_from_fd(
+        frame_fd: OwnedFd,
+        config: TapConfig,
+        proxy_child: Option<Child>,
+    ) -> io::Result<Self> {
         // Set up channels for stack communication
         let (cmd_tx, cmd_rx) = bounded::<StackCommand>(256);
         let (frame_tx, frame_rx) = bounded::<Vec<u8>>(256);
         let (frame_to_proxy_tx, frame_to_proxy_rx) = bounded::<Vec<u8>>(256);
 
-        // Convert parent FD to blocking UnixStream for IPC
-        let ipc_stream = fd_to_unix_stream(parent_fd)?;
+        // Convert FD to blocking UnixStream for IPC
+        let ipc_stream = fd_to_unix_stream(frame_fd)?;
         ipc_stream.set_nonblocking(false)?;
 
         // Generate MAC address
         let mac = config.mac.unwrap_or_else(|| {
             // Generate a locally administered unicast MAC
             let mut mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
-            mac[5] = (pid & 0xff) as u8;
+            // Use random byte for uniqueness when no PID available
+            mac[5] = (std::process::id() & 0xff) as u8;
             mac
         });
 
@@ -390,7 +452,7 @@ impl Tunnel {
         // Spawn IPC reader thread (proxy -> stack)
         let ipc_reader_thread = std::thread::spawn(move || {
             debug!("[IPC-RX] reader thread starting");
-            let mut buf = [0u8; 1522]; // TODO: constant
+            let mut buf = [0u8; 1522];
             loop {
                 use std::io::Read;
                 match (&ipc_read_stream).read(&mut buf) {

@@ -119,8 +119,18 @@ RUST_LOG=trace cargo run --example echo_tunnel <PID>  # very verbose
 
 **Sockets:**
 - `tunnel.tcp_connect(addr)` - Create a TCP connection
-- `tunnel.tcp_listen(addr)` - Create a TCP listener
+- `tunnel.tcp_listen(addr)` - Create a TCP listener (default backlog: 16)
+- `tunnel.tcp_listen_with_backlog(addr, backlog)` - Create a TCP listener with custom backlog
 - `tunnel.udp_bind(addr)` - Create a UDP socket
+
+**TcpListener:**
+- `listener.accept()` - Accept incoming connection, returns `(TcpStream, SocketAddr)`
+- `listener.local_addr()` - Get the local address the listener is bound to
+
+Note: The backlog is implemented by maintaining multiple sockets in the Listen state
+on the same endpoint. When a connection is accepted, a replacement listening socket
+is spawned to maintain the backlog capacity. This mirrors smoltcp's model where each
+listening socket can only accept one connection.
 
 ### TapConfig
 

@@ -832,10 +832,10 @@ fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<(Ipv4Addr, u8
     let ips: Vec<_> = iface
         .ip_addrs()
         .iter()
-        .filter_map(|cidr| match cidr {
+        .map(|cidr| match cidr {
             IpCidr::Ipv4(c) => {
                 let octets = c.address().octets();
-                Some((Ipv4Addr::from(octets), c.prefix_len()))
+                (Ipv4Addr::from(octets), c.prefix_len())
             }
         })
         .collect();

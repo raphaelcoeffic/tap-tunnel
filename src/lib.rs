@@ -179,6 +179,8 @@ struct TunnelInner {
     ipc_reader_thread: Mutex<Option<JoinHandle<()>>>,
     /// Gateway info from proxy: (tap_ip, tap_mac)
     gateway: Option<(Ipv4Addr, [u8; 6])>,
+    /// Local IP (first IP added to the interface)
+    local_addr: (Ipv4Addr, u8),
 }
 
 impl Drop for TunnelInner {
@@ -427,6 +429,11 @@ impl Tunnel {
         Self::setup_stack_from_fd(frame_fd, config, Some(proxy_child), gateway)
     }
 
+    /// Local IP (first IP added to the interface)
+    pub fn local_addr(&self) -> (Ipv4Addr, u8) {
+        self.inner.local_addr
+    }
+
     /// Connect to a proxy already listening on the given Unix socket path.
     ///
     /// This performs a handshake with the proxy to receive its identity
@@ -631,6 +638,7 @@ impl Tunnel {
                 stack_thread: Mutex::new(Some(stack_thread)),
                 ipc_reader_thread: Mutex::new(Some(ipc_reader_thread)),
                 gateway,
+                local_addr: (local_ip, local_prefix),
             }),
         })
     }

@@ -48,7 +48,7 @@ Client Process                          Target Namespace
 User async code (tokio)
     ↓
 Tunnel API (tcp_connect, udp_bind)
-    ↓ crossbeam channels
+    ↓ tokio mpsc channels
 smoltcp Stack Thread (blocking)
     ├─ Interface + SocketSet
     ├─ Poll loop with 1ms tick

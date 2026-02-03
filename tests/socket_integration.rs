@@ -253,6 +253,8 @@ async fn test_tcp_retransmission_with_packet_loss() {
 
 #[tokio::test]
 async fn test_udp_send_recv() {
+    init_logging();
+
     let ns_proc = udp_echo_server_ns(15000).expect("failed to create namespace");
     let pid = ns_proc.pid();
 

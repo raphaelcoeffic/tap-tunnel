@@ -7,7 +7,6 @@ mod device;
 
 pub use device::ProxyDevice;
 
-use crossbeam_channel::{Receiver, TryRecvError};
 use log::{debug, trace, warn};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::Device;
@@ -20,6 +19,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
+use tokio::sync::mpsc::{Receiver, error::TryRecvError};
 use tokio::sync::oneshot;
 
 type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
@@ -94,8 +94,6 @@ pub enum StackCommand {
     GetIps {
         response: oneshot::Sender<Vec<(Ipv4Addr, u8)>>,
     },
-    /// Shutdown the stack thread.
-    Shutdown,
 }
 
 /// Pending operations waiting for socket state changes.
@@ -136,7 +134,11 @@ pub struct StackConfig {
 /// - Incoming frames from the proxy (via device)
 /// - Socket commands from async handles
 /// - Protocol state machines (TCP, ARP, etc.)
-pub fn run_stack(device: &mut impl Device, config: StackConfig, commands: Receiver<StackCommand>) {
+pub fn run_stack(
+    device: &mut impl Device,
+    config: StackConfig,
+    mut commands: Receiver<StackCommand>,
+) {
     debug!("run_stack starting");
 
     // Create smoltcp interface
@@ -293,9 +295,6 @@ fn handle_command(
         }
         StackCommand::GetIps { response } => {
             handle_get_ips(iface, response);
-        }
-        StackCommand::Shutdown => {
-            return false;
         }
     }
     true

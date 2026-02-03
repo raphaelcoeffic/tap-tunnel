@@ -1,12 +1,12 @@
 //! smoltcp Device implementation that bridges to the TAP proxy via channels.
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use log::{trace, warn};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Ipv4Packet,
 };
+use tokio::sync::mpsc::{Receiver, Sender, error::TryRecvError};
 
 /// smoltcp device that communicates with the TAP proxy via channels.
 ///

@@ -4,10 +4,10 @@
 //! but backed by the smoltcp userspace TCP/IP stack.
 
 use crate::stack::StackCommand;
-use crossbeam_channel::Sender;
 use smoltcp::iface::SocketHandle;
 use std::io;
 use std::net::SocketAddr;
+use tokio::sync::mpsc::Sender;
 
 /// A TCP stream connected to a remote endpoint.
 ///
@@ -36,6 +36,7 @@ impl TcpStream {
                 max_len: buf.len(),
                 response: tx,
             })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
 
         let data = rx
@@ -59,6 +60,7 @@ impl TcpStream {
                 data: buf.to_vec(),
                 response: tx,
             })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
 
         rx.await
@@ -83,7 +85,8 @@ impl TcpStream {
 
     /// Close the stream.
     pub fn close(&self) {
-        let _ = self.commands.send(StackCommand::TcpClose {
+        // Use try_send for non-blocking close (fire-and-forget)
+        let _ = self.commands.try_send(StackCommand::TcpClose {
             handle: self.handle,
         });
     }
@@ -121,6 +124,7 @@ impl UdpSocket {
                 data: buf.to_vec(),
                 response: tx,
             })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
 
         rx.await
@@ -136,6 +140,7 @@ impl UdpSocket {
                 handle: self.handle,
                 response: tx,
             })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
 
         let (data, addr) = rx
@@ -149,7 +154,8 @@ impl UdpSocket {
 
     /// Close the socket.
     pub fn close(&self) {
-        let _ = self.commands.send(StackCommand::UdpClose {
+        // Use try_send for non-blocking close (fire-and-forget)
+        let _ = self.commands.try_send(StackCommand::UdpClose {
             handle: self.handle,
         });
     }
@@ -196,6 +202,7 @@ impl TcpListener {
                 handle: self.handle,
                 response: tx,
             })
+            .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
 
         let (stream_handle, peer_addr) = rx
@@ -215,7 +222,8 @@ impl TcpListener {
 
     /// Close the listener.
     pub fn close(&self) {
-        let _ = self.commands.send(StackCommand::TcpListenerClose {
+        // Use try_send for non-blocking close (fire-and-forget)
+        let _ = self.commands.try_send(StackCommand::TcpListenerClose {
             handle: self.handle,
         });
     }

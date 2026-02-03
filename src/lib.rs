@@ -79,6 +79,38 @@ pub use socket::{
     TcpListener as TunnelTcpListener, TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket,
 };
 
+/// Capacity of the command channel between async API and stack task.
+///
+/// This limits how many pending socket operations can be queued.
+const COMMAND_CHANNEL_CAPACITY: usize = 256;
+
+/// Capacity of the frame channels between IPC tasks and stack task.
+///
+/// This limits how many Ethernet frames can be buffered in each direction.
+const FRAME_CHANNEL_CAPACITY: usize = 256;
+
+/// Maximum Ethernet frame size (MTU + Ethernet header).
+///
+/// Standard Ethernet MTU is 1500 bytes, plus 14 bytes for the Ethernet header.
+const ETHERNET_MAX_FRAME_SIZE: usize = 1514;
+
+/// Buffer size for reading frames from IPC.
+///
+/// Slightly larger than max frame size to handle any framing overhead.
+const IPC_READ_BUFFER_SIZE: usize = 1600;
+
+/// Default backlog for TCP listeners.
+///
+/// This is the number of pending connections that can be queued before
+/// new connections are refused.
+const DEFAULT_TCP_BACKLOG: usize = 8;
+
+/// Channel sender for stack commands.
+pub(crate) type CommandSender = Sender<StackCommand>;
+
+/// IPv4 address with prefix length (e.g., 10.0.0.1/24).
+pub type Ipv4WithPrefix = (Ipv4Addr, u8);
+
 /// Configuration for the TAP tunnel.
 ///
 /// The tunnel creates a point-to-point link between the smoltcp stack (client side)
@@ -95,9 +127,9 @@ pub struct TapConfig {
     /// Name of the TAP interface (default: "tap0")
     pub interface_name: String,
     /// IPv4 address for the TAP interface in the namespace (peer side)
-    pub peer_addr: Option<(Ipv4Addr, u8)>,
+    pub peer_addr: Option<Ipv4WithPrefix>,
     /// IPv4 address for the smoltcp stack (local/client side)
-    pub local_addr: Option<(Ipv4Addr, u8)>,
+    pub local_addr: Option<Ipv4WithPrefix>,
     /// MAC address for the smoltcp stack (default: auto-generated)
     pub mac: Option<[u8; 6]>,
     /// Packet loss percentage for testing (0-100, default: 0)
@@ -169,13 +201,13 @@ pub struct Tunnel {
 
 struct TunnelInner {
     /// Channel to send commands to the stack thread
-    commands: Sender<StackCommand>,
+    commands: CommandSender,
     /// TAP proxy child process (None when using socket-path mode)
     proxy_child: Mutex<Option<Child>>,
     /// Gateway info from proxy: (tap_ip, tap_mac)
     gateway: (Ipv4Addr, [u8; 6]),
     /// Local IP (first IP added to the interface)
-    local_addr: (Ipv4Addr, u8),
+    local_addr: Ipv4WithPrefix,
 }
 
 impl Drop for TunnelInner {
@@ -365,20 +397,14 @@ impl Tunnel {
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf)?;
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "proxy closed connection during handshake",
-            ));
+            return Err(unexpected_eof("proxy closed connection during handshake"));
         }
 
         let msg = decode_message(&buf[..n])?;
         let proxy_config: ProxyConfig = match msg {
             Message::Control(payload) => decode_control(&payload)?,
             Message::Frame(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected ProxyConfig, got frame",
-                ));
+                return Err(invalid_data("expected ProxyConfig, got frame"));
             }
         };
         debug!("received ProxyConfig: {}", proxy_config);
@@ -466,20 +492,14 @@ impl Tunnel {
         let mut buf = [0u8; 1024];
         let n = stream.read(&mut buf)?;
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "proxy closed connection during handshake",
-            ));
+            return Err(unexpected_eof("proxy closed connection during handshake"));
         }
 
         let msg = decode_message(&buf[..n])?;
         let proxy_config: ProxyConfig = match msg {
             Message::Control(payload) => decode_control(&payload)?,
             Message::Frame(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "expected ProxyConfig, got frame",
-                ));
+                return Err(invalid_data("expected ProxyConfig, got frame"));
             }
         };
         debug!("received ProxyConfig: {:?}", proxy_config);
@@ -509,9 +529,10 @@ impl Tunnel {
         gateway: (Ipv4Addr, [u8; 6]),
     ) -> io::Result<Self> {
         // Set up channels for stack communication
-        let (cmd_tx, cmd_rx) = mpsc::channel::<StackCommand>(256);
-        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (frame_to_proxy_tx, mut frame_to_proxy_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        let (frame_tx, frame_rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let (frame_to_proxy_tx, mut frame_to_proxy_rx) =
+            mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_CAPACITY);
 
         // Generate MAC address
         let mac = config.mac.unwrap_or_else(|| {
@@ -521,14 +542,14 @@ impl Tunnel {
         });
 
         // Get IP configuration for smoltcp stack (local/client side)
-        let (local_ip, local_prefix) = config.local_addr.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "local_addr must be configured")
-        })?;
+        let (local_ip, local_prefix) = config
+            .local_addr
+            .ok_or_else(|| invalid_input("local_addr must be configured"))?;
 
         // Gateway IP is the peer address (TAP interface in namespace)
         let (gateway_ip, _) = config
             .peer_addr
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "peer_addr missing"))?;
+            .ok_or_else(|| invalid_input("peer_addr missing"))?;
 
         let stack_config = StackConfig {
             mac,
@@ -553,7 +574,7 @@ impl Tunnel {
             use tokio::io::AsyncReadExt;
 
             debug!("[IPC-RX] reader thread starting");
-            let mut buf = [0u8; 1600];
+            let mut buf = [0u8; IPC_READ_BUFFER_SIZE];
             while let Ok(n) = ipc_read_stream.read(&mut buf).await {
                 if n == 0 {
                     debug!("[IPC-RX] proxy closed connection");
@@ -587,7 +608,7 @@ impl Tunnel {
         });
 
         // Create device for smoltcp
-        let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, 1514);
+        let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, ETHERNET_MAX_FRAME_SIZE);
         let mut device = FaultInjector::new(device, random_seed());
         device.set_drop_chance(config.packet_loss_percent);
 
@@ -620,11 +641,9 @@ impl Tunnel {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        let handle = rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+        let handle = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
 
         Ok(TcpStream::from_handle(handle, self.inner.commands.clone()))
     }
@@ -655,7 +674,8 @@ impl Tunnel {
     /// # }
     /// ```
     pub async fn tcp_listen(&self, addr: SocketAddr) -> io::Result<TcpListener> {
-        self.tcp_listen_with_backlog(addr, 8).await
+        self.tcp_listen_with_backlog(addr, DEFAULT_TCP_BACKLOG)
+            .await
     }
 
     /// Create a TCP listener with a specified backlog.
@@ -677,11 +697,9 @@ impl Tunnel {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        let (handle, local_addr) = rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+        let (handle, local_addr) = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
 
         Ok(TcpListener::from_handle(
             handle,
@@ -698,11 +716,9 @@ impl Tunnel {
             .commands
             .send(StackCommand::UdpBind { addr, response: tx })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        let handle = rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+        let handle = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
 
         Ok(UdpSocket::from_handle(handle, self.inner.commands.clone()))
     }
@@ -726,11 +742,9 @@ impl Tunnel {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        let handle = rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+        let handle = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
 
         Ok(TcpStream::from_handle(handle, self.inner.commands.clone()))
     }
@@ -750,10 +764,9 @@ impl Tunnel {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?
+        rx.await.map_err(|_| broken_pipe("stack thread gone"))?
     }
 
     /// Remove a local IP address from the smoltcp interface.
@@ -764,30 +777,28 @@ impl Tunnel {
             .commands
             .send(StackCommand::RemoveIp { ip, response: tx })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?
+        rx.await.map_err(|_| broken_pipe("stack thread gone"))?
     }
 
     /// Get current local IP addresses on the smoltcp interface.
     ///
     /// Returns a list of (IP, prefix_len) pairs.
-    pub async fn local_ips(&self) -> io::Result<Vec<(Ipv4Addr, u8)>> {
+    pub async fn local_ips(&self) -> io::Result<Vec<Ipv4WithPrefix>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.inner
             .commands
             .send(StackCommand::GetIps { response: tx })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))
+        rx.await.map_err(|_| broken_pipe("stack thread gone"))
     }
 
     /// Local IP (first IP added to the interface)
-    pub fn local_addr(&self) -> (Ipv4Addr, u8) {
+    pub fn local_addr(&self) -> Ipv4WithPrefix {
         self.inner.local_addr
     }
 
@@ -810,4 +821,20 @@ fn random_seed() -> u32 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos()
+}
+
+fn broken_pipe(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, msg)
+}
+
+fn invalid_input(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+fn invalid_data(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+fn unexpected_eof(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, msg)
 }

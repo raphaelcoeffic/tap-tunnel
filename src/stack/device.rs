@@ -8,19 +8,25 @@ use smoltcp::wire::{
 };
 use tokio::sync::mpsc::{Receiver, Sender, error::TryRecvError};
 
+/// Channel for receiving Ethernet frames from the IPC task.
+type FrameReceiver = Receiver<Vec<u8>>;
+
+/// Channel for sending Ethernet frames to the IPC task.
+type FrameSender = Sender<Vec<u8>>;
+
 /// smoltcp device that communicates with the TAP proxy via channels.
 ///
 /// Frames received from the proxy are queued in `rx`, and frames to transmit
 /// are sent via `tx`.
 pub struct ProxyDevice {
-    rx: Receiver<Vec<u8>>,
-    tx: Sender<Vec<u8>>,
+    rx: FrameReceiver,
+    tx: FrameSender,
     mtu: usize,
 }
 
 impl ProxyDevice {
     /// Create a new ProxyDevice with the given channels and MTU.
-    pub fn new(rx: Receiver<Vec<u8>>, tx: Sender<Vec<u8>>, mtu: usize) -> Self {
+    pub fn new(rx: FrameReceiver, tx: FrameSender, mtu: usize) -> Self {
         Self { rx, tx, mtu }
     }
 }
@@ -71,7 +77,7 @@ impl RxToken for ProxyRxToken {
 
 /// TxToken for transmitting a frame to the proxy.
 pub struct ProxyTxToken<'a> {
-    tx: &'a Sender<Vec<u8>>,
+    tx: &'a FrameSender,
 }
 
 impl<'a> TxToken for ProxyTxToken<'a> {

@@ -3,11 +3,11 @@
 //! These types provide a familiar async socket API (similar to tokio::net)
 //! but backed by the smoltcp userspace TCP/IP stack.
 
+use crate::CommandSender;
 use crate::stack::StackCommand;
 use smoltcp::iface::SocketHandle;
 use std::io;
 use std::net::SocketAddr;
-use tokio::sync::mpsc::Sender;
 
 /// A TCP stream connected to a remote endpoint.
 ///
@@ -15,12 +15,12 @@ use tokio::sync::mpsc::Sender;
 /// but backed by smoltcp running in a dedicated thread.
 pub struct TcpStream {
     handle: SocketHandle,
-    commands: Sender<StackCommand>,
+    commands: CommandSender,
 }
 
 impl TcpStream {
     /// Create a TcpStream from an existing socket handle.
-    pub(crate) fn from_handle(handle: SocketHandle, commands: Sender<StackCommand>) -> Self {
+    pub(crate) fn from_handle(handle: SocketHandle, commands: CommandSender) -> Self {
         Self { handle, commands }
     }
 
@@ -104,12 +104,12 @@ impl Drop for TcpStream {
 /// but backed by smoltcp running in a dedicated thread.
 pub struct UdpSocket {
     handle: SocketHandle,
-    commands: Sender<StackCommand>,
+    commands: CommandSender,
 }
 
 impl UdpSocket {
     /// Create a UdpSocket from an existing socket handle.
-    pub(crate) fn from_handle(handle: SocketHandle, commands: Sender<StackCommand>) -> Self {
+    pub(crate) fn from_handle(handle: SocketHandle, commands: CommandSender) -> Self {
         Self { handle, commands }
     }
 
@@ -174,7 +174,7 @@ impl Drop for UdpSocket {
 pub struct TcpListener {
     handle: SocketHandle,
     local_addr: SocketAddr,
-    commands: Sender<StackCommand>,
+    commands: CommandSender,
 }
 
 impl TcpListener {
@@ -182,7 +182,7 @@ impl TcpListener {
     pub(crate) fn from_handle(
         handle: SocketHandle,
         local_addr: SocketAddr,
-        commands: Sender<StackCommand>,
+        commands: CommandSender,
     ) -> Self {
         Self {
             handle,

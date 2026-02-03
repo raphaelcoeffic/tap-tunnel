@@ -7,6 +7,7 @@ mod device;
 
 pub use device::ProxyDevice;
 
+use crate::Ipv4WithPrefix;
 use log::{debug, trace, warn};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::Device;
@@ -29,7 +30,43 @@ use tokio::sync::oneshot;
 /// packets, the task yields to allow other tasks to run.
 const INGRESS_BATCH_SIZE: usize = 16;
 
+/// Size of TCP socket send and receive buffers in bytes.
+///
+/// This is the maximum amount of data that can be buffered for a single TCP
+/// connection in each direction. 64KB matches the maximum TCP window size
+/// without window scaling.
+const TCP_SOCKET_BUFFER_SIZE: usize = 65535;
+
+/// Size of UDP socket packet buffer in bytes.
+///
+/// This is the total buffer space for UDP packets. With standard MTU, this
+/// allows buffering many packets.
+const UDP_PACKET_BUFFER_SIZE: usize = 65535;
+
+/// Number of UDP packet metadata slots.
+///
+/// This limits how many UDP packets can be queued at once. Each slot holds
+/// metadata (source/dest addresses) for one packet.
+const UDP_PACKET_METADATA_SLOTS: usize = 16;
+
+/// Starting port number for ephemeral port allocation.
+///
+/// Per IANA, the dynamic/ephemeral port range is 49152-65535.
+const EPHEMERAL_PORT_START: u16 = 49152;
+
+/// Maximum poll interval in milliseconds.
+///
+/// The stack will poll at least this often, even if smoltcp doesn't request
+/// earlier polling. This ensures responsiveness to incoming frames.
+const MAX_POLL_INTERVAL_MS: u64 = 1;
+
 type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
+
+/// Map of socket handles to their pending operations.
+type PendingOps = HashMap<SocketHandle, PendingOp>;
+
+/// Map of listener handles to their state.
+type Listeners = HashMap<SocketHandle, ListenerState>;
 
 /// Commands sent from async socket handles to the stack thread.
 pub enum StackCommand {
@@ -99,7 +136,7 @@ pub enum StackCommand {
     },
     /// Get all IP addresses on the smoltcp interface.
     GetIps {
-        response: oneshot::Sender<Vec<(Ipv4Addr, u8)>>,
+        response: oneshot::Sender<Vec<Ipv4WithPrefix>>,
     },
 }
 
@@ -174,17 +211,18 @@ pub async fn run_stack(
 
     // Socket storage
     let mut sockets = SocketSet::new(vec![]);
-    let mut pending: HashMap<SocketHandle, PendingOp> = HashMap::new();
-    let mut listeners: HashMap<SocketHandle, ListenerState> = HashMap::new();
+    let mut pending: PendingOps = HashMap::new();
+    let mut listeners: Listeners = HashMap::new();
 
     loop {
         // Calculate poll interval based on smoltcp's needs
         let timestamp = instant_since(start_timestamp);
         let poll_delay = iface.poll_delay(timestamp, &sockets);
         let poll_interval = if let Some(delay) = poll_delay {
-            StdDuration::from_micros(delay.total_micros()).min(StdDuration::from_millis(1))
+            StdDuration::from_micros(delay.total_micros())
+                .min(StdDuration::from_millis(MAX_POLL_INTERVAL_MS))
         } else {
-            StdDuration::from_millis(1)
+            StdDuration::from_millis(MAX_POLL_INTERVAL_MS)
         };
 
         // Wait for either a command or timeout
@@ -232,7 +270,10 @@ pub async fn run_stack(
 
         // Process egress (responses, retransmits, etc.)
         let egress_result = iface.poll_egress(timestamp, device, &mut sockets);
-        if matches!(egress_result, smoltcp::iface::PollResult::SocketStateChanged) {
+        if matches!(
+            egress_result,
+            smoltcp::iface::PollResult::SocketStateChanged
+        ) {
             socket_state_changed = true;
         }
 
@@ -250,8 +291,8 @@ fn handle_command(
     cmd: StackCommand,
     iface: &mut Interface,
     sockets: &mut SocketSet<'_>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
-    listeners: &mut HashMap<SocketHandle, ListenerState>,
+    pending: &mut PendingOps,
+    listeners: &mut Listeners,
     config: &StackConfig,
 ) -> bool {
     match cmd {
@@ -331,15 +372,15 @@ fn handle_tcp_connect(
     addr: SocketAddr,
     iface: &mut Interface,
     sockets: &mut SocketSet<'_>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
+    pending: &mut PendingOps,
     config: &StackConfig,
     response: oneshot::Sender<io::Result<SocketHandle>>,
 ) {
     debug!("tcp_connect to {} from {:?}", addr, local_ip);
 
     // Create TCP socket with buffers
-    let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
-    let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_SIZE]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_SIZE]);
     let socket = tcp::Socket::new(rx_buf, tx_buf);
 
     // Add socket first, then connect
@@ -379,7 +420,7 @@ fn handle_tcp_listen(
     addr: SocketAddr,
     backlog: usize,
     sockets: &mut SocketSet<'_>,
-    listeners: &mut HashMap<SocketHandle, ListenerState>,
+    listeners: &mut Listeners,
     response: oneshot::Sender<io::Result<(SocketHandle, SocketAddr)>>,
 ) {
     debug!("tcp_listen on {} with backlog {}", addr, backlog);
@@ -428,8 +469,8 @@ fn handle_tcp_listen(
     let mut listening_handles = Vec::with_capacity(backlog);
 
     for _ in 0..backlog {
-        let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
-        let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_SIZE]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_SIZE]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
 
         if let Err(e) = socket.listen(listen_endpoint) {
@@ -471,8 +512,8 @@ fn handle_tcp_listen(
 fn handle_tcp_accept(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
-    listeners: &mut HashMap<SocketHandle, ListenerState>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
+    listeners: &mut Listeners,
+    pending: &mut PendingOps,
     response: ResponseSender<(SocketHandle, SocketAddr)>,
 ) {
     trace!("tcp_accept on handle={:?}", handle);
@@ -552,8 +593,8 @@ fn try_accept(
         }
     };
 
-    let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
-    let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
+    let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_SIZE]);
+    let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_SIZE]);
     let mut socket = tcp::Socket::new(rx_buf, tx_buf);
 
     if socket.listen(listen_endpoint).is_ok() {
@@ -573,8 +614,8 @@ fn try_accept(
 fn handle_tcp_listener_close(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
-    listeners: &mut HashMap<SocketHandle, ListenerState>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
+    listeners: &mut Listeners,
+    pending: &mut PendingOps,
 ) {
     debug!("tcp_listener_close: handle={:?}", handle);
 
@@ -599,7 +640,7 @@ fn handle_tcp_send(
     handle: SocketHandle,
     data: Vec<u8>,
     sockets: &mut SocketSet<'_>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
+    pending: &mut PendingOps,
     response: ResponseSender<usize>,
 ) {
     trace!("tcp_send: {} bytes", data.len());
@@ -651,7 +692,7 @@ fn handle_tcp_recv(
     handle: SocketHandle,
     max_len: usize,
     sockets: &mut SocketSet<'_>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
+    pending: &mut PendingOps,
     response: ResponseSender<Vec<u8>>,
 ) {
     trace!("tcp_recv: max_len={}", max_len);
@@ -685,11 +726,7 @@ fn handle_tcp_recv(
     pending.insert(handle, PendingOp::TcpRecv { max_len, response });
 }
 
-fn handle_tcp_close(
-    handle: SocketHandle,
-    sockets: &mut SocketSet<'_>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
-) {
+fn handle_tcp_close(handle: SocketHandle, sockets: &mut SocketSet<'_>, pending: &mut PendingOps) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     socket.close();
     pending.remove(&handle);
@@ -703,8 +740,14 @@ fn handle_udp_bind(
 ) {
     debug!("udp_bind: addr={}", addr);
 
-    let rx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 65535]);
-    let tx_buf = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 65535]);
+    let rx_buf = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; UDP_PACKET_METADATA_SLOTS],
+        vec![0u8; UDP_PACKET_BUFFER_SIZE],
+    );
+    let tx_buf = udp::PacketBuffer::new(
+        vec![udp::PacketMetadata::EMPTY; UDP_PACKET_METADATA_SLOTS],
+        vec![0u8; UDP_PACKET_BUFFER_SIZE],
+    );
     let mut socket = udp::Socket::new(rx_buf, tx_buf);
 
     // For port 0, allocate an ephemeral port
@@ -773,14 +816,14 @@ fn handle_udp_send(
 fn handle_udp_recv(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
+    pending: &mut PendingOps,
     response: ResponseSender<(Vec<u8>, SocketAddr)>,
 ) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
 
     // Try to receive immediately
     if socket.can_recv() {
-        let mut buf = vec![0u8; 65535];
+        let mut buf = vec![0u8; UDP_PACKET_BUFFER_SIZE];
         if let Ok((n, meta)) = socket.recv_slice(&mut buf) {
             buf.truncate(n);
             let addr = endpoint_to_socket_addr(meta.endpoint);
@@ -793,11 +836,7 @@ fn handle_udp_recv(
     pending.insert(handle, PendingOp::UdpRecv(response));
 }
 
-fn handle_udp_close(
-    handle: SocketHandle,
-    sockets: &mut SocketSet<'_>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
-) {
+fn handle_udp_close(handle: SocketHandle, sockets: &mut SocketSet<'_>, pending: &mut PendingOps) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
     socket.close();
     pending.remove(&handle);
@@ -851,7 +890,7 @@ fn handle_remove_ip(
     let _ = response.send(Ok(()));
 }
 
-fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<(Ipv4Addr, u8)>>) {
+fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<Ipv4WithPrefix>>) {
     let ips: Vec<_> = iface
         .ip_addrs()
         .iter()
@@ -870,8 +909,8 @@ fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<(Ipv4Addr, u8
 /// Process pending operations that may now be completable.
 fn process_pending(
     sockets: &mut SocketSet<'_>,
-    pending: &mut HashMap<SocketHandle, PendingOp>,
-    listeners: &mut HashMap<SocketHandle, ListenerState>,
+    pending: &mut PendingOps,
+    listeners: &mut Listeners,
 ) {
     let handles: Vec<_> = pending.keys().cloned().collect();
 
@@ -999,7 +1038,7 @@ fn process_pending(
                 let socket = sockets.get_mut::<udp::Socket>(handle);
                 if socket.can_recv() {
                     if let Some(PendingOp::UdpRecv(response)) = pending.remove(&handle) {
-                        let mut buf = vec![0u8; 65535];
+                        let mut buf = vec![0u8; UDP_PACKET_BUFFER_SIZE];
                         match socket.recv_slice(&mut buf) {
                             Ok((n, meta)) => {
                                 buf.truncate(n);
@@ -1050,7 +1089,7 @@ fn endpoint_to_socket_addr(endpoint: IpEndpoint) -> SocketAddr {
     }
 }
 
-static EPHEMERAL_PORT: atomic::AtomicU16 = atomic::AtomicU16::new(49152);
+static EPHEMERAL_PORT: atomic::AtomicU16 = atomic::AtomicU16::new(EPHEMERAL_PORT_START);
 
 fn allocate_ephemeral_port() -> u16 {
     EPHEMERAL_PORT.fetch_add(1, atomic::Ordering::Relaxed)

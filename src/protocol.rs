@@ -109,6 +109,32 @@ pub fn validate_ip_in_subnet(ip: Ipv4Addr, tap_ip: Ipv4Addr, prefix_len: u8) -> 
     (ip_u32 & mask) == (tap_u32 & mask)
 }
 
+impl std::fmt::Display for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "tap_ip={}, tap_mac={}, prefix_len={}",
+            self.tap_ip,
+            PrettyHwAddr(&self.tap_mac),
+            self.prefix_len
+        )
+    }
+}
+
+struct PrettyHwAddr<'a>(&'a [u8; 6]);
+
+impl<'a> std::fmt::Display for PrettyHwAddr<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let _ = write!(
+            f,
+            "{:<02x}-{:<02x}-{:<02x}-{:<02x}-{:<02x}-{:<02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        );
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,7 +4,9 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use log::{trace, warn};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
-use smoltcp::wire::{ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Ipv4Packet};
+use smoltcp::wire::{
+    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Ipv4Packet,
+};
 
 /// smoltcp device that communicates with the TAP proxy via channels.
 ///
@@ -117,17 +119,19 @@ fn log_frame(direction: &str, frame: &[u8]) {
                     && let Ok(arp) = ArpRepr::parse(&arp)
                 {
                     if let ArpRepr::EthernetIpv4 {
+                        operation,
                         source_protocol_addr,
                         target_protocol_addr,
                         ..
                     } = arp
                     {
                         trace!(
-                            "{} {} bytes: ARP {} -> {}",
+                            "{} {} bytes: ARP {} -> {} {}",
                             direction,
                             frame.len(),
                             source_protocol_addr,
-                            target_protocol_addr
+                            target_protocol_addr,
+                            arp_op_str(operation)
                         );
                     }
                 } else {
@@ -143,5 +147,13 @@ fn log_frame(direction: &str, frame: &[u8]) {
         }
     } else {
         trace!("{} {} bytes: (invalid frame)", direction, frame.len());
+    }
+}
+
+fn arp_op_str(operation: ArpOperation) -> &'static str {
+    match operation {
+        ArpOperation::Request => "Request",
+        ArpOperation::Reply => "Reply",
+        _ => "Unknown",
     }
 }

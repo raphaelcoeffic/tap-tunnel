@@ -252,7 +252,7 @@ fn perform_handshake(fd: &OwnedFd, config: &TapConfig, tap_mac: [u8; 6]) -> io::
     if written < 0 {
         return Err(io::Error::last_os_error());
     }
-    debug!("sent ProxyConfig: {:?}", proxy_config);
+    debug!("sent ProxyConfig: {}", proxy_config);
 
     Ok(())
 }

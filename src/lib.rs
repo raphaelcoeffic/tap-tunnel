@@ -394,7 +394,7 @@ impl Tunnel {
                 ));
             }
         };
-        debug!("received ProxyConfig: {:?}", proxy_config);
+        debug!("received ProxyConfig: {}", proxy_config);
 
         // Store gateway info
         let gateway = Some((proxy_config.tap_ip, proxy_config.tap_mac));

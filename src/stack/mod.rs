@@ -22,6 +22,13 @@ use std::time::{Duration as StdDuration, Instant as StdInstant};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 
+/// Maximum number of ingress packets to process per poll iteration.
+///
+/// This bounds the work done in each async task iteration to avoid blocking
+/// the tokio runtime when many packets are queued. After processing this many
+/// packets, the task yields to allow other tasks to run.
+const INGRESS_BATCH_SIZE: usize = 16;
+
 type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
 
 /// Commands sent from async socket handles to the stack thread.
@@ -209,12 +216,28 @@ pub async fn run_stack(
             }
         }
 
-        // Poll the interface
+        // Poll the interface in batches to avoid blocking the runtime
         let timestamp = instant_since(start_timestamp);
-        let poll_result = iface.poll(timestamp, device, &mut sockets);
+        let mut socket_state_changed = false;
+
+        for _ in 0..INGRESS_BATCH_SIZE {
+            match iface.poll_ingress_single(timestamp, device, &mut sockets) {
+                smoltcp::iface::PollIngressSingleResult::None => break,
+                smoltcp::iface::PollIngressSingleResult::PacketProcessed => {}
+                smoltcp::iface::PollIngressSingleResult::SocketStateChanged => {
+                    socket_state_changed = true;
+                }
+            }
+        }
+
+        // Process egress (responses, retransmits, etc.)
+        let egress_result = iface.poll_egress(timestamp, device, &mut sockets);
+        if matches!(egress_result, smoltcp::iface::PollResult::SocketStateChanged) {
+            socket_state_changed = true;
+        }
 
         // Process pending operations that may now be completable
-        if matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged) {
+        if socket_state_changed {
             trace!("socket state changed");
             process_pending(&mut sockets, &mut pending, &mut listeners);
         }

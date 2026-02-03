@@ -1,4 +1,4 @@
-//! smoltcp network stack running on a dedicated thread.
+//! smoltcp network stack running as a tokio task.
 //!
 //! This module provides a TCP/UDP socket API backed by smoltcp, which handles
 //! all protocol processing (Ethernet, ARP, IP, TCP, UDP) in userspace.
@@ -19,7 +19,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
-use tokio::sync::mpsc::{Receiver, error::TryRecvError};
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 
 type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
@@ -128,13 +128,13 @@ pub struct StackConfig {
     pub gateway: Ipv4Addr,
 }
 
-/// Run the smoltcp stack on the current thread (blocking).
+/// Run the smoltcp stack as an async task.
 ///
 /// This function runs the smoltcp poll loop, processing:
 /// - Incoming frames from the proxy (via device)
 /// - Socket commands from async handles
 /// - Protocol state machines (TCP, ARP, etc.)
-pub fn run_stack(
+pub async fn run_stack(
     device: &mut impl Device,
     config: StackConfig,
     mut commands: Receiver<StackCommand>,
@@ -171,50 +171,53 @@ pub fn run_stack(
     let mut listeners: HashMap<SocketHandle, ListenerState> = HashMap::new();
 
     loop {
-        // 1. Process commands (non-blocking)
-        match commands.try_recv() {
-            Ok(cmd) => {
-                trace!("received command");
-                if !handle_command(
-                    cmd,
-                    &mut iface,
-                    &mut sockets,
-                    &mut pending,
-                    &mut listeners,
-                    &config,
-                ) {
-                    debug!("stack shutting down");
-                    return;
-                }
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                debug!("command channel disconnected");
-                return;
-            }
-        }
-
-        // 2. Poll the interface
+        // Calculate poll interval based on smoltcp's needs
         let timestamp = instant_since(start_timestamp);
-        let poll_result = iface.poll(timestamp, device, &mut sockets);
-
-        // 3. Process pending operations that may now be completable
-        if matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged) {
-            trace!("socket state changed");
-            process_pending(&mut sockets, &mut pending, &mut listeners);
-        }
-
-        // 4. Calculate sleep duration
-        // Use a short timeout to be responsive to incoming frames
         let poll_delay = iface.poll_delay(timestamp, &sockets);
-
-        let sleep_duration = if let Some(delay) = poll_delay {
+        let poll_interval = if let Some(delay) = poll_delay {
             StdDuration::from_micros(delay.total_micros()).min(StdDuration::from_millis(1))
         } else {
             StdDuration::from_millis(1)
         };
 
-        std::thread::sleep(sleep_duration);
+        // Wait for either a command or timeout
+        tokio::select! {
+            cmd = commands.recv() => {
+                match cmd {
+                    Some(cmd) => {
+                        trace!("received command");
+                        if !handle_command(
+                            cmd,
+                            &mut iface,
+                            &mut sockets,
+                            &mut pending,
+                            &mut listeners,
+                            &config,
+                        ) {
+                            debug!("stack shutting down");
+                            return;
+                        }
+                    }
+                    None => {
+                        debug!("command channel disconnected");
+                        return;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(poll_interval) => {
+                // Timeout - continue to poll interface
+            }
+        }
+
+        // Poll the interface
+        let timestamp = instant_since(start_timestamp);
+        let poll_result = iface.poll(timestamp, device, &mut sockets);
+
+        // Process pending operations that may now be completable
+        if matches!(poll_result, smoltcp::iface::PollResult::SocketStateChanged) {
+            trace!("socket state changed");
+            process_pending(&mut sockets, &mut pending, &mut listeners);
+        }
     }
 }
 

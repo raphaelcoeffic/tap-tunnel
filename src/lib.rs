@@ -591,9 +591,9 @@ impl Tunnel {
         let mut device = FaultInjector::new(device, random_seed());
         device.set_drop_chance(config.packet_loss_percent);
 
-        // Spawn stack thread (detached - will exit when command channel disconnects)
-        std::thread::spawn(move || {
-            stack::run_stack(&mut device, stack_config, cmd_rx);
+        // Spawn stack task (will exit when command channel disconnects)
+        tokio::spawn(async move {
+            stack::run_stack(&mut device, stack_config, cmd_rx).await;
         });
 
         Ok(Tunnel {

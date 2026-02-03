@@ -160,6 +160,9 @@ pub fn run_stack(device: &mut impl Device, config: StackConfig, commands: Receiv
             .expect("failed to add default route");
     }
 
+    // Enable Any-IP
+    iface.set_any_ip(true);
+
     debug!("stack started: mac={}, ip={}", mac, ip_cidr);
 
     // Socket storage

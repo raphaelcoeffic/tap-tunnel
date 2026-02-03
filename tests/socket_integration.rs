@@ -869,11 +869,9 @@ async fn test_tunnel_gateway() {
         .await
         .expect("failed to connect");
 
-    // Gateway should be available and contain the TAP IP
+    // Gateway should contain the TAP IP
     let gateway = tunnel.gateway();
-    assert!(gateway.is_some(), "gateway should be available");
-
-    let (tap_ip, tap_mac) = gateway.unwrap();
+    let (tap_ip, tap_mac) = gateway;
     assert_eq!(tap_ip, PEER_IP, "gateway IP should match peer_addr");
 
     // MAC should be a valid non-zero address
@@ -1140,14 +1138,9 @@ async fn test_socket_path_mode_gateway() {
         .await
         .expect("failed to connect");
 
-    // Gateway should be available
+    // Gateway IP should match PEER_IP
     let gateway = tunnel.gateway();
-    assert!(
-        gateway.is_some(),
-        "gateway should be available in socket-path mode"
-    );
-
-    let (tap_ip, tap_mac) = gateway.unwrap();
+    let (tap_ip, tap_mac) = gateway;
     assert_eq!(tap_ip, PEER_IP, "gateway IP should match");
     assert!(
         tap_mac.iter().any(|&b| b != 0),

@@ -127,7 +127,7 @@ pub struct StackConfig {
     pub mac: [u8; 6],
     pub ip: Ipv4Addr,
     pub prefix_len: u8,
-    pub gateway: Option<Ipv4Addr>,
+    pub gateway: Ipv4Addr,
 }
 
 /// Run the smoltcp stack on the current thread (blocking).
@@ -153,12 +153,10 @@ pub fn run_stack(device: &mut impl Device, config: StackConfig, commands: Receiv
     });
 
     // Configure gateway if provided
-    if let Some(gw) = config.gateway {
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(gw.octets().into())
-            .expect("failed to add default route");
-    }
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(config.gateway.octets().into())
+        .expect("failed to add default route");
 
     // Enable Any-IP
     iface.set_any_ip(true);

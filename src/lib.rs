@@ -178,7 +178,7 @@ struct TunnelInner {
     /// IPC reader thread handle
     ipc_reader_thread: Mutex<Option<JoinHandle<()>>>,
     /// Gateway info from proxy: (tap_ip, tap_mac)
-    gateway: Option<(Ipv4Addr, [u8; 6])>,
+    gateway: (Ipv4Addr, [u8; 6]),
     /// Local IP (first IP added to the interface)
     local_addr: (Ipv4Addr, u8),
 }
@@ -399,7 +399,7 @@ impl Tunnel {
         debug!("received ProxyConfig: {}", proxy_config);
 
         // Store gateway info
-        let gateway = Some((proxy_config.tap_ip, proxy_config.tap_mac));
+        let gateway = (proxy_config.tap_ip, proxy_config.tap_mac);
 
         // Client picks its own IP: use configured local_addr or default (tap_ip + 1)
         let client_ip = config
@@ -427,11 +427,6 @@ impl Tunnel {
         };
 
         Self::setup_stack_from_fd(frame_fd, config, Some(proxy_child), gateway)
-    }
-
-    /// Local IP (first IP added to the interface)
-    pub fn local_addr(&self) -> (Ipv4Addr, u8) {
-        self.inner.local_addr
     }
 
     /// Connect to a proxy already listening on the given Unix socket path.
@@ -512,7 +507,7 @@ impl Tunnel {
         debug!("received ProxyConfig: {:?}", proxy_config);
 
         // Store gateway info
-        let gateway = Some((proxy_config.tap_ip, proxy_config.tap_mac));
+        let gateway = (proxy_config.tap_ip, proxy_config.tap_mac);
 
         // Client picks its own IP: use provided local_ip or default (tap_ip + 1)
         let client_ip = local_ip.unwrap_or_else(|| default_client_ip(proxy_config.tap_ip));
@@ -540,7 +535,7 @@ impl Tunnel {
         frame_fd: OwnedFd,
         config: TapConfig,
         proxy_child: Option<Child>,
-        gateway: Option<(Ipv4Addr, [u8; 6])>,
+        gateway: (Ipv4Addr, [u8; 6]),
     ) -> io::Result<Self> {
         // Set up channels for stack communication
         let (cmd_tx, cmd_rx) = bounded::<StackCommand>(256);
@@ -564,7 +559,9 @@ impl Tunnel {
         })?;
 
         // Gateway IP is the peer address (TAP interface in namespace)
-        let gateway_ip = config.peer_addr.map(|(ip, _)| ip);
+        let (gateway_ip, _) = config
+            .peer_addr
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "peer_addr missing"))?;
 
         let stack_config = StackConfig {
             mac,
@@ -816,10 +813,13 @@ impl Tunnel {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))
     }
 
+    /// Local IP (first IP added to the interface)
+    pub fn local_addr(&self) -> (Ipv4Addr, u8) {
+        self.inner.local_addr
+    }
+
     /// Get the proxy's gateway info (TAP IP and MAC address).
-    ///
-    /// Returns `None` if the tunnel was not set up with gateway info.
-    pub fn gateway(&self) -> Option<(Ipv4Addr, [u8; 6])> {
+    pub fn gateway(&self) -> (Ipv4Addr, [u8; 6]) {
         self.inner.gateway
     }
 }

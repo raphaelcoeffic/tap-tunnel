@@ -13,6 +13,87 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// Helper for poll_read implementations.
+fn poll_tcp_read(
+    handle: SocketHandle,
+    commands: &CommandSender,
+    cx: &mut Context<'_>,
+    buf: &mut ReadBuf<'_>,
+) -> Poll<io::Result<()>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    match commands.try_send(StackCommand::TcpRecv {
+        handle,
+        max_len: buf.remaining(),
+        response: tx,
+    }) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stack thread gone",
+            )));
+        }
+    }
+
+    let mut rx = Box::pin(rx);
+    match rx.as_mut().poll(cx) {
+        Poll::Ready(Ok(Ok(data))) => {
+            buf.put_slice(&data);
+            Poll::Ready(Ok(()))
+        }
+        Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
+        Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "stack thread gone",
+        ))),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+/// Helper for poll_write implementations.
+fn poll_tcp_write(
+    handle: SocketHandle,
+    commands: &CommandSender,
+    cx: &mut Context<'_>,
+    buf: &[u8],
+) -> Poll<io::Result<usize>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    match commands.try_send(StackCommand::TcpSend {
+        handle,
+        data: buf.to_vec(),
+        response: tx,
+    }) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stack thread gone",
+            )));
+        }
+    }
+
+    let mut rx = Box::pin(rx);
+    match rx.as_mut().poll(cx) {
+        Poll::Ready(Ok(Ok(n))) => Poll::Ready(Ok(n)),
+        Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
+        Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "stack thread gone",
+        ))),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 /// A TCP stream connected to a remote endpoint.
 ///
 /// This provides an async read/write interface similar to `tokio::net::TcpStream`,
@@ -130,43 +211,7 @@ impl AsyncRead for TcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Create a future for this read operation
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        // Try to send the command
-        match self.commands.try_send(StackCommand::TcpRecv {
-            handle: self.handle,
-            max_len: buf.remaining(),
-            response: tx,
-        }) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Channel is full, register waker and return pending
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "stack thread gone",
-                )));
-            }
-        }
-
-        // Poll the receiver
-        let mut rx = Box::pin(rx);
-        match rx.as_mut().poll(cx) {
-            Poll::Ready(Ok(Ok(data))) => {
-                buf.put_slice(&data);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stack thread gone",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        poll_tcp_read(self.handle, &self.commands, cx, buf)
     }
 }
 
@@ -176,44 +221,10 @@ impl AsyncWrite for TcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Create a future for this write operation
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        // Try to send the command
-        match self.commands.try_send(StackCommand::TcpSend {
-            handle: self.handle,
-            data: buf.to_vec(),
-            response: tx,
-        }) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Channel is full, register waker and return pending
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "stack thread gone",
-                )));
-            }
-        }
-
-        // Poll the receiver
-        let mut rx = Box::pin(rx);
-        match rx.as_mut().poll(cx) {
-            Poll::Ready(Ok(Ok(n))) => Poll::Ready(Ok(n)),
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stack thread gone",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        poll_tcp_write(self.handle, &self.commands, cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Data is sent immediately to the stack, no buffering
         Poll::Ready(Ok(()))
     }
 
@@ -323,43 +334,7 @@ impl AsyncRead for OwnedReadHalf {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Create a future for this read operation
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        // Try to send the command
-        match self.inner.commands.try_send(StackCommand::TcpRecv {
-            handle: self.inner.handle,
-            max_len: buf.remaining(),
-            response: tx,
-        }) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Channel is full, register waker and return pending
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "stack thread gone",
-                )));
-            }
-        }
-
-        // Poll the receiver
-        let mut rx = Box::pin(rx);
-        match rx.as_mut().poll(cx) {
-            Poll::Ready(Ok(Ok(data))) => {
-                buf.put_slice(&data);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stack thread gone",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        poll_tcp_read(self.inner.handle, &self.inner.commands, cx, buf)
     }
 }
 
@@ -431,44 +406,10 @@ impl AsyncWrite for OwnedWriteHalf {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Create a future for this write operation
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        // Try to send the command
-        match self.inner.commands.try_send(StackCommand::TcpSend {
-            handle: self.inner.handle,
-            data: buf.to_vec(),
-            response: tx,
-        }) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                // Channel is full, register waker and return pending
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "stack thread gone",
-                )));
-            }
-        }
-
-        // Poll the receiver
-        let mut rx = Box::pin(rx);
-        match rx.as_mut().poll(cx) {
-            Poll::Ready(Ok(Ok(n))) => Poll::Ready(Ok(n)),
-            Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stack thread gone",
-            ))),
-            Poll::Pending => Poll::Pending,
-        }
+        poll_tcp_write(self.inner.handle, &self.inner.commands, cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Data is sent immediately to the stack, no buffering
         Poll::Ready(Ok(()))
     }
 

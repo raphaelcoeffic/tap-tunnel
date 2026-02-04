@@ -71,11 +71,12 @@ type Listeners = HashMap<SocketHandle, ListenerState>;
 /// Commands sent from async socket handles to the stack thread.
 pub enum StackCommand {
     /// Create a TCP socket and initiate connection.
+    /// Returns (handle, local_addr, peer_addr) on success.
     TcpConnect {
         /// Optional local IP to bind the socket to. If None, uses the default (config.ip).
         local_ip: Option<Ipv4Addr>,
         addr: SocketAddr,
-        response: ResponseSender<SocketHandle>,
+        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
     },
     /// Create a TCP listener and bind to the given address.
     TcpListen {
@@ -84,9 +85,10 @@ pub enum StackCommand {
         response: ResponseSender<(SocketHandle, SocketAddr)>,
     },
     /// Accept an incoming connection on a TCP listener.
+    /// Returns (handle, local_addr, peer_addr) on success.
     TcpAccept {
         handle: SocketHandle,
-        response: ResponseSender<(SocketHandle, SocketAddr)>,
+        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
     },
     /// Close a TCP listener and all its pending sockets.
     TcpListenerClose { handle: SocketHandle },
@@ -105,9 +107,10 @@ pub enum StackCommand {
     /// Close a TCP socket.
     TcpClose { handle: SocketHandle },
     /// Bind a UDP socket.
+    /// Returns (handle, actual_bound_addr) on success.
     UdpBind {
         addr: SocketAddr,
-        response: ResponseSender<SocketHandle>,
+        response: ResponseSender<(SocketHandle, SocketAddr)>,
     },
     /// Send data on a UDP socket.
     UdpSend {
@@ -142,8 +145,14 @@ pub enum StackCommand {
 
 /// Pending operations waiting for socket state changes.
 enum PendingOp {
-    TcpConnect(ResponseSender<SocketHandle>),
-    TcpAccept(ResponseSender<(SocketHandle, SocketAddr)>),
+    TcpConnect {
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
+    },
+    TcpAccept {
+        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
+    },
     TcpSend {
         data: Vec<u8>,
         offset: usize,
@@ -374,7 +383,7 @@ fn handle_tcp_connect(
     sockets: &mut SocketSet<'_>,
     pending: &mut PendingOps,
     config: &StackConfig,
-    response: oneshot::Sender<io::Result<SocketHandle>>,
+    response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
 ) {
     debug!("tcp_connect to {} from {:?}", addr, local_ip);
 
@@ -412,8 +421,19 @@ fn handle_tcp_connect(
 
     trace!("tcp_connect initiated: handle={:?}", handle);
 
-    // Store pending connect
-    pending.insert(handle, PendingOp::TcpConnect(response));
+    // Construct local and peer addresses for later
+    let local_addr = SocketAddr::V4(SocketAddrV4::new(source_ip, local_port));
+    let peer_addr = addr;
+
+    // Store pending connect with address info
+    pending.insert(
+        handle,
+        PendingOp::TcpConnect {
+            local_addr,
+            peer_addr,
+            response,
+        },
+    );
 }
 
 fn handle_tcp_listen(
@@ -514,7 +534,7 @@ fn handle_tcp_accept(
     sockets: &mut SocketSet<'_>,
     listeners: &mut Listeners,
     pending: &mut PendingOps,
-    response: ResponseSender<(SocketHandle, SocketAddr)>,
+    response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
 ) {
     trace!("tcp_accept on handle={:?}", handle);
 
@@ -538,26 +558,34 @@ fn handle_tcp_accept(
 
     // No connection ready yet - store as pending
     trace!("tcp_accept: no connection ready, queuing");
-    pending.insert(handle, PendingOp::TcpAccept(response));
+    pending.insert(handle, PendingOp::TcpAccept { response });
 }
 
 /// Try to accept a connection from one of the listener's sockets.
-/// If successful, returns the accepted socket handle and peer address,
+/// If successful, returns the accepted socket handle, local address, and peer address,
 /// and spawns a replacement listening socket.
 fn try_accept(
     sockets: &mut SocketSet<'_>,
     state: &mut ListenerState,
-) -> Option<(SocketHandle, SocketAddr)> {
+) -> Option<(SocketHandle, SocketAddr, SocketAddr)> {
     // Find a socket that has transitioned to Established
     let mut accepted_idx = None;
     let mut peer_addr = None;
+    let mut local_addr = None;
 
     for (idx, &socket_handle) in state.listening_handles.iter().enumerate() {
         let socket = sockets.get_mut::<tcp::Socket>(socket_handle);
         if socket.state() == TcpState::Established {
-            // Get peer address before we remove from the list
+            // Get peer and local addresses before we remove from the list
             if let Some(remote) = socket.remote_endpoint() {
                 peer_addr = Some(endpoint_to_socket_addr(remote));
+                // Get the actual local endpoint from the socket
+                if let Some(local) = socket.local_endpoint() {
+                    local_addr = Some(endpoint_to_socket_addr(local));
+                } else {
+                    // Fallback to listener's address
+                    local_addr = Some(state.addr);
+                }
                 accepted_idx = Some(idx);
                 break;
             }
@@ -566,13 +594,15 @@ fn try_accept(
 
     let idx = accepted_idx?;
     let peer = peer_addr?;
+    let local = local_addr?;
 
     // Remove the accepted socket from listening_handles
     let accepted_handle = state.listening_handles.remove(idx);
 
     debug!(
-        "TCP accept: handle={:?}, peer={}, remaining_listeners={}",
+        "TCP accept: handle={:?}, local={}, peer={}, remaining_listeners={}",
         accepted_handle,
+        local,
         peer,
         state.listening_handles.len()
     );
@@ -589,7 +619,7 @@ fn try_accept(
         },
         SocketAddr::V6(_) => {
             // Shouldn't happen, but handle gracefully
-            return Some((accepted_handle, peer));
+            return Some((accepted_handle, local, peer));
         }
     };
 
@@ -608,7 +638,7 @@ fn try_accept(
         warn!("Failed to create replacement listener socket");
     }
 
-    Some((accepted_handle, peer))
+    Some((accepted_handle, local, peer))
 }
 
 fn handle_tcp_listener_close(
@@ -736,7 +766,7 @@ fn handle_tcp_close(handle: SocketHandle, sockets: &mut SocketSet<'_>, pending: 
 fn handle_udp_bind(
     addr: SocketAddr,
     sockets: &mut SocketSet<'_>,
-    response: ResponseSender<SocketHandle>,
+    response: ResponseSender<(SocketHandle, SocketAddr)>,
 ) {
     debug!("udp_bind: addr={}", addr);
 
@@ -757,6 +787,18 @@ fn handle_udp_bind(
         addr.port()
     };
 
+    // Construct the actual bound address (with allocated port if ephemeral)
+    let bound_addr = match addr {
+        SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)),
+        SocketAddr::V6(_) => {
+            let _ = response.send(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "IPv6 not supported",
+            )));
+            return;
+        }
+    };
+
     let endpoint = IpListenEndpoint {
         addr: match addr {
             SocketAddr::V4(v4) => {
@@ -766,13 +808,7 @@ fn handle_udp_bind(
                     Some(IpAddress::Ipv4(*v4.ip()))
                 }
             }
-            SocketAddr::V6(_) => {
-                let _ = response.send(Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "IPv6 not supported",
-                )));
-                return;
-            }
+            SocketAddr::V6(_) => unreachable!(), // Already handled above
         },
         port,
     };
@@ -789,8 +825,8 @@ fn handle_udp_bind(
     }
 
     let handle = sockets.add(socket);
-    debug!("UDP bound: handle={:?}, addr={}", handle, addr);
-    let _ = response.send(Ok(handle));
+    debug!("UDP bound: handle={:?}, addr={}", handle, bound_addr);
+    let _ = response.send(Ok((handle, bound_addr)));
 }
 
 fn handle_udp_send(
@@ -916,14 +952,19 @@ fn process_pending(
 
     for handle in handles {
         let completed = match pending.get(&handle) {
-            Some(PendingOp::TcpConnect(_)) => {
+            Some(PendingOp::TcpConnect { .. }) => {
                 let socket = sockets.get_mut::<tcp::Socket>(handle);
                 let state = socket.state();
                 match state {
                     TcpState::Established => {
                         debug!("TCP connected: handle={:?}", handle);
-                        if let Some(PendingOp::TcpConnect(response)) = pending.remove(&handle) {
-                            let _ = response.send(Ok(handle));
+                        if let Some(PendingOp::TcpConnect {
+                            local_addr,
+                            peer_addr,
+                            response,
+                        }) = pending.remove(&handle)
+                        {
+                            let _ = response.send(Ok((handle, local_addr, peer_addr)));
                         }
                         true
                     }
@@ -932,7 +973,9 @@ fn process_pending(
                             "TCP connection failed: handle={:?}, state={:?}",
                             handle, state
                         );
-                        if let Some(PendingOp::TcpConnect(response)) = pending.remove(&handle) {
+                        if let Some(PendingOp::TcpConnect { response, .. }) =
+                            pending.remove(&handle)
+                        {
                             let _ = response.send(Err(io::Error::new(
                                 io::ErrorKind::ConnectionRefused,
                                 "connection failed",
@@ -943,11 +986,13 @@ fn process_pending(
                     _ => false,
                 }
             }
-            Some(PendingOp::TcpAccept(_)) => {
+            Some(PendingOp::TcpAccept { .. }) => {
                 // Check if we have a listener for this handle and try to accept
                 if let Some(state) = listeners.get_mut(&handle) {
                     if let Some(result) = try_accept(sockets, state) {
-                        if let Some(PendingOp::TcpAccept(response)) = pending.remove(&handle) {
+                        if let Some(PendingOp::TcpAccept { response, .. }) =
+                            pending.remove(&handle)
+                        {
                             let _ = response.send(Ok(result));
                         }
                         true
@@ -956,7 +1001,7 @@ fn process_pending(
                     }
                 } else {
                     // Listener was closed, fail the pending accept
-                    if let Some(PendingOp::TcpAccept(response)) = pending.remove(&handle) {
+                    if let Some(PendingOp::TcpAccept { response, .. }) = pending.remove(&handle) {
                         let _ = response.send(Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "listener closed",

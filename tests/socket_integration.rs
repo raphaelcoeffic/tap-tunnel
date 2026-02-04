@@ -1110,6 +1110,265 @@ async fn test_tunnel_multi_ip_connections() {
     }
 }
 
+// ============================================================================
+// Address Tracking Tests
+// ============================================================================
+
+/// Test that TcpStream.local_addr() and peer_addr() return correct addresses.
+#[tokio::test]
+async fn test_tcp_local_addr_peer_addr() {
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19300).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let server_addr: std::net::SocketAddr = format!("{}:19300", PEER_IP).parse().unwrap();
+    let stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    // local_addr should be the local IP with an ephemeral port
+    let local_addr = stream.local_addr();
+    assert_eq!(
+        local_addr.ip(),
+        std::net::IpAddr::V4(LOCAL_IP),
+        "local IP should match"
+    );
+    assert!(local_addr.port() >= 49152, "local port should be ephemeral");
+
+    // peer_addr should match the server address we connected to
+    let peer_addr = stream.peer_addr();
+    assert_eq!(peer_addr, server_addr, "peer address should match server");
+
+    // Verify stream still works
+    stream
+        .write_all(b"addr test\n")
+        .await
+        .expect("write failed");
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"addr test\n");
+}
+
+/// Test that UdpSocket.local_addr() returns the actual bound address including ephemeral port.
+#[tokio::test]
+async fn test_udp_local_addr_ephemeral() {
+    init_logging();
+
+    let ns_proc = udp_echo_server_ns(15100).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    // Bind to port 0 to get an ephemeral port
+    let bind_addr: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
+    let socket = tunnel.udp_bind(bind_addr).await.expect("failed to udp_bind");
+
+    // local_addr should have the actual allocated port, not 0
+    let local_addr = socket.local_addr();
+    assert_eq!(
+        local_addr.ip(),
+        std::net::IpAddr::V4(LOCAL_IP),
+        "local IP should match"
+    );
+    assert!(
+        local_addr.port() >= 49152,
+        "local port should be ephemeral, got {}",
+        local_addr.port()
+    );
+    assert_ne!(local_addr.port(), 0, "port should not be 0");
+
+    // Verify socket still works
+    let server_addr: std::net::SocketAddr = format!("{}:15100", PEER_IP).parse().unwrap();
+    socket
+        .send_to(b"udp addr test", server_addr)
+        .await
+        .expect("send_to failed");
+
+    let mut buf = [0u8; 64];
+    let (n, _) = socket.recv_from(&mut buf).await.expect("recv_from failed");
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(response, "echo: udp addr test");
+}
+
+// ============================================================================
+// Split Tests
+// ============================================================================
+
+/// Test TcpStream::into_split() for concurrent read/write.
+#[tokio::test]
+async fn test_tcp_into_split() {
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19301).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let server_addr = format!("{}:19301", PEER_IP).parse().unwrap();
+    let stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    // Split the stream
+    let (read_half, write_half) = stream.into_split();
+
+    // Verify addresses are accessible from both halves
+    assert_eq!(
+        read_half.local_addr(),
+        write_half.local_addr(),
+        "local addresses should match"
+    );
+    assert_eq!(
+        read_half.peer_addr(),
+        write_half.peer_addr(),
+        "peer addresses should match"
+    );
+
+    // Use both halves concurrently
+    let write_task = tokio::spawn(async move {
+        for i in 0..3 {
+            let msg = format!("split msg {}\n", i);
+            write_half
+                .write_all(msg.as_bytes())
+                .await
+                .expect("write failed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        write_half
+    });
+
+    let read_task = tokio::spawn(async move {
+        let mut total = Vec::new();
+        for _ in 0..3 {
+            let mut buf = [0u8; 64];
+            let n = read_half.read(&mut buf).await.expect("read failed");
+            total.extend_from_slice(&buf[..n]);
+        }
+        (read_half, total)
+    });
+
+    let write_half = write_task.await.expect("write task panicked");
+    let (read_half, data) = read_task.await.expect("read task panicked");
+    let data_str = String::from_utf8_lossy(&data);
+
+    assert!(
+        data_str.contains("split msg 0"),
+        "should receive msg 0: {}",
+        data_str
+    );
+    assert!(
+        data_str.contains("split msg 1"),
+        "should receive msg 1: {}",
+        data_str
+    );
+    assert!(
+        data_str.contains("split msg 2"),
+        "should receive msg 2: {}",
+        data_str
+    );
+
+    // Dropping both halves should close the socket
+    drop(read_half);
+    drop(write_half);
+}
+
+/// Test that socket is closed only when both split halves are dropped.
+#[tokio::test]
+async fn test_tcp_split_drop_behavior() {
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19302).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let server_addr = format!("{}:19302", PEER_IP).parse().unwrap();
+    let stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    let (read_half, write_half) = stream.into_split();
+
+    // Drop read half first - socket should still be usable via write half
+    drop(read_half);
+
+    // Write should still work (socket not closed yet)
+    write_half
+        .write_all(b"after read drop\n")
+        .await
+        .expect("write should still work after dropping read half");
+
+    // Drop write half - this should close the socket
+    drop(write_half);
+}
+
+// ============================================================================
+// AsyncRead/AsyncWrite Tests
+// ============================================================================
+
+/// Test AsyncRead/AsyncWrite traits using tokio::io utilities.
+#[tokio::test]
+async fn test_tcp_async_read_write_traits() {
+    use tokio::io::AsyncWriteExt;
+
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19303).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let server_addr = format!("{}:19303", PEER_IP).parse().unwrap();
+    let mut stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    // Use AsyncWriteExt
+    stream
+        .write_all(b"async trait test\n")
+        .await
+        .expect("async write failed");
+
+    // Use AsyncReadExt
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("async read failed");
+    assert_eq!(&buf[..n], b"async trait test\n");
+
+    // Test flush (no-op but should succeed)
+    stream.flush().await.expect("flush failed");
+
+    // Test shutdown
+    stream.shutdown().await.expect("shutdown failed");
+}
+
 /// Test socket-path mode with gateway() API.
 #[tokio::test]
 async fn test_socket_path_mode_gateway() {

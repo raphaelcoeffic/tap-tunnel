@@ -76,7 +76,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
 
 pub use socket::{
-    TcpListener as TunnelTcpListener, TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket,
+    OwnedReadHalf, OwnedWriteHalf, TcpListener as TunnelTcpListener,
+    TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket,
 };
 
 /// Capacity of the command channel between async API and stack task.
@@ -643,9 +644,15 @@ impl Tunnel {
             .await
             .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        let handle = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
+        let (handle, local_addr, peer_addr) =
+            rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
 
-        Ok(TcpStream::from_handle(handle, self.inner.commands.clone()))
+        Ok(TcpStream::from_handle(
+            handle,
+            self.inner.commands.clone(),
+            local_addr,
+            peer_addr,
+        ))
     }
 
     /// Create a TCP listener bound to the given address.
@@ -718,9 +725,13 @@ impl Tunnel {
             .await
             .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        let handle = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
+        let (handle, local_addr) = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
 
-        Ok(UdpSocket::from_handle(handle, self.inner.commands.clone()))
+        Ok(UdpSocket::from_handle(
+            handle,
+            self.inner.commands.clone(),
+            local_addr,
+        ))
     }
 
     /// Create a TCP connection from a specific local IP address.
@@ -744,9 +755,15 @@ impl Tunnel {
             .await
             .map_err(|_| broken_pipe("stack thread gone"))?;
 
-        let handle = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
+        let (handle, local_addr, peer_addr) =
+            rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
 
-        Ok(TcpStream::from_handle(handle, self.inner.commands.clone()))
+        Ok(TcpStream::from_handle(
+            handle,
+            self.inner.commands.clone(),
+            local_addr,
+            peer_addr,
+        ))
     }
 
     /// Add a local IP address to the smoltcp interface.

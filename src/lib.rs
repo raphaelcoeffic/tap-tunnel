@@ -644,14 +644,15 @@ impl Tunnel {
             .await
             .map_err(|_| broken_pipe("stack task gone"))?;
 
-        let (handle, local_addr, peer_addr) =
+        let (handle, local_addr, peer_addr, channels) =
             rx.await.map_err(|_| broken_pipe("stack task gone"))??;
 
-        Ok(TcpStream::from_handle(
+        Ok(TcpStream::from_channels(
             handle,
             self.inner.commands.clone(),
             local_addr,
             peer_addr,
+            channels,
         ))
     }
 
@@ -725,12 +726,14 @@ impl Tunnel {
             .await
             .map_err(|_| broken_pipe("stack task gone"))?;
 
-        let (handle, local_addr) = rx.await.map_err(|_| broken_pipe("stack task gone"))??;
+        let (handle, local_addr, channels) =
+            rx.await.map_err(|_| broken_pipe("stack task gone"))??;
 
-        Ok(UdpSocket::from_handle(
+        Ok(UdpSocket::from_channels(
             handle,
             self.inner.commands.clone(),
             local_addr,
+            channels,
         ))
     }
 
@@ -755,14 +758,15 @@ impl Tunnel {
             .await
             .map_err(|_| broken_pipe("stack task gone"))?;
 
-        let (handle, local_addr, peer_addr) =
+        let (handle, local_addr, peer_addr, channels) =
             rx.await.map_err(|_| broken_pipe("stack task gone"))??;
 
-        Ok(TcpStream::from_handle(
+        Ok(TcpStream::from_channels(
             handle,
             self.inner.commands.clone(),
             local_addr,
             peer_addr,
+            channels,
         ))
     }
 

@@ -18,9 +18,11 @@ use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndp
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::sync::atomic;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::oneshot;
 
 /// Maximum number of ingress packets to process per poll iteration.
@@ -60,7 +62,93 @@ const EPHEMERAL_PORT_START: u16 = 49152;
 /// earlier polling. This ensures responsiveness to incoming frames.
 const MAX_POLL_INTERVAL_MS: u64 = 1;
 
+/// Capacity of per-TCP-socket data channels.
+///
+/// This limits how many data chunks can be buffered between the socket API
+/// and the stack task. Each chunk is typically up to TCP_SOCKET_BUFFER_SIZE.
+const TCP_CHANNEL_CAPACITY: usize = 8;
+
+/// Capacity of per-UDP-socket data channels.
+///
+/// This limits how many packets can be buffered between the socket API
+/// and the stack task.
+const UDP_CHANNEL_CAPACITY: usize = 32;
+
 type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
+
+/// Channels for TCP socket data flow.
+///
+/// These channels provide a dedicated path for data between the async socket
+/// API and the stack task, avoiding per-operation commands.
+pub struct TcpChannels {
+    /// Write path: socket → stack (data to send)
+    pub write_tx: mpsc::Sender<Vec<u8>>,
+    /// Read path: stack → socket (received data)
+    pub read_rx: mpsc::Receiver<Vec<u8>>,
+    /// Notify stack when data is written
+    pub write_notify: Arc<Notify>,
+}
+
+/// Internal state held by stack task for each TCP socket.
+struct TcpSocketState {
+    write_rx: mpsc::Receiver<Vec<u8>>,
+    read_tx: mpsc::Sender<Vec<u8>>,
+    pending_write: Option<Vec<u8>>,
+}
+
+/// Channels for UDP socket data flow.
+///
+/// Similar to TcpChannels but includes destination/source address with each packet.
+pub struct UdpChannels {
+    /// Write path: socket → stack (data + destination)
+    pub write_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    /// Read path: stack → socket (data + source)
+    pub read_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    /// Notify stack when data is written
+    pub write_notify: Arc<Notify>,
+}
+
+/// Internal state held by stack task for each UDP socket.
+struct UdpSocketState {
+    write_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    read_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+}
+
+/// Create TCP channels for a new socket.
+fn create_tcp_channels(write_notify: Arc<Notify>) -> (TcpChannels, TcpSocketState) {
+    let (write_tx, write_rx) = mpsc::channel(TCP_CHANNEL_CAPACITY);
+    let (read_tx, read_rx) = mpsc::channel(TCP_CHANNEL_CAPACITY);
+
+    let channels = TcpChannels {
+        write_tx,
+        read_rx,
+        write_notify,
+    };
+
+    let state = TcpSocketState {
+        write_rx,
+        read_tx,
+        pending_write: None,
+    };
+
+    (channels, state)
+}
+
+/// Create UDP channels for a new socket.
+fn create_udp_channels(write_notify: Arc<Notify>) -> (UdpChannels, UdpSocketState) {
+    let (write_tx, write_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
+    let (read_tx, read_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
+
+    let channels = UdpChannels {
+        write_tx,
+        read_rx,
+        write_notify,
+    };
+
+    let state = UdpSocketState { write_rx, read_tx };
+
+    (channels, state)
+}
 
 /// Map of socket handles to their pending operations.
 type PendingOps = HashMap<SocketHandle, PendingOp>;
@@ -71,12 +159,12 @@ type Listeners = HashMap<SocketHandle, ListenerState>;
 /// Commands sent from async socket handles to the stack task.
 pub enum StackCommand {
     /// Create a TCP socket and initiate connection.
-    /// Returns (handle, local_addr, peer_addr) on success.
+    /// Returns (handle, local_addr, peer_addr, channels) on success.
     TcpConnect {
         /// Optional local IP to bind the socket to. If None, uses the default (config.ip).
         local_ip: Option<Ipv4Addr>,
         addr: SocketAddr,
-        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
+        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
     /// Create a TCP listener and bind to the given address.
     TcpListen {
@@ -85,44 +173,20 @@ pub enum StackCommand {
         response: ResponseSender<(SocketHandle, SocketAddr)>,
     },
     /// Accept an incoming connection on a TCP listener.
-    /// Returns (handle, local_addr, peer_addr) on success.
+    /// Returns (handle, local_addr, peer_addr, channels) on success.
     TcpAccept {
         handle: SocketHandle,
-        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
+        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
     /// Close a TCP listener and all its pending sockets.
     TcpListenerClose { handle: SocketHandle },
-    /// Send data on a TCP socket.
-    TcpSend {
-        handle: SocketHandle,
-        data: Vec<u8>,
-        response: ResponseSender<usize>,
-    },
-    /// Receive data from a TCP socket.
-    TcpRecv {
-        handle: SocketHandle,
-        max_len: usize,
-        response: ResponseSender<Vec<u8>>,
-    },
     /// Close a TCP socket.
     TcpClose { handle: SocketHandle },
     /// Bind a UDP socket.
-    /// Returns (handle, actual_bound_addr) on success.
+    /// Returns (handle, actual_bound_addr, channels) on success.
     UdpBind {
         addr: SocketAddr,
-        response: ResponseSender<(SocketHandle, SocketAddr)>,
-    },
-    /// Send data on a UDP socket.
-    UdpSend {
-        handle: SocketHandle,
-        dest: SocketAddr,
-        data: Vec<u8>,
-        response: ResponseSender<usize>,
-    },
-    /// Receive data from a UDP socket.
-    UdpRecv {
-        handle: SocketHandle,
-        response: ResponseSender<(Vec<u8>, SocketAddr)>,
+        response: ResponseSender<(SocketHandle, SocketAddr, UdpChannels)>,
     },
     /// Close a UDP socket.
     UdpClose { handle: SocketHandle },
@@ -148,21 +212,12 @@ enum PendingOp {
     TcpConnect {
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
-        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
+        channels: TcpChannels,
+        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
     TcpAccept {
-        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
+        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
-    TcpSend {
-        data: Vec<u8>,
-        offset: usize,
-        response: ResponseSender<usize>,
-    },
-    TcpRecv {
-        max_len: usize,
-        response: ResponseSender<Vec<u8>>,
-    },
-    UdpRecv(ResponseSender<(Vec<u8>, SocketAddr)>),
 }
 
 /// State for a TCP listener managing multiple listening sockets for backlog.
@@ -223,6 +278,13 @@ pub async fn run_stack(
     let mut pending: PendingOps = HashMap::new();
     let mut listeners: Listeners = HashMap::new();
 
+    // Per-socket data channel state
+    let mut tcp_states: HashMap<SocketHandle, TcpSocketState> = HashMap::new();
+    let mut udp_states: HashMap<SocketHandle, UdpSocketState> = HashMap::new();
+
+    // Notify used to signal when data is written to any socket's channel
+    let write_notify = Arc::new(Notify::new());
+
     loop {
         // Calculate poll interval based on smoltcp's needs
         let timestamp = instant_since(start_timestamp);
@@ -234,8 +296,10 @@ pub async fn run_stack(
             StdDuration::from_millis(MAX_POLL_INTERVAL_MS)
         };
 
-        // Wait for either a command or timeout
+        // Wait for either a command, write notification, or timeout
         tokio::select! {
+            biased;
+
             cmd = commands.recv() => {
                 match cmd {
                     Some(cmd) => {
@@ -247,6 +311,9 @@ pub async fn run_stack(
                             &mut pending,
                             &mut listeners,
                             &config,
+                            &mut tcp_states,
+                            &mut udp_states,
+                            &write_notify,
                         ) {
                             debug!("stack shutting down");
                             return;
@@ -258,10 +325,19 @@ pub async fn run_stack(
                     }
                 }
             }
+
+            // TODO: poll UnorderedFutures instead
+            //
+            // Application wrote data - need to poll write channels
+            _ = write_notify.notified() => {}
+
             _ = tokio::time::sleep(poll_interval) => {
                 // Timeout - continue to poll interface
             }
         }
+
+        // Poll write channels for all sockets (app -> smoltcp)
+        poll_write_channels(&mut sockets, &mut tcp_states, &mut udp_states);
 
         // Poll the interface in batches to avoid blocking the runtime
         let timestamp = instant_since(start_timestamp);
@@ -286,10 +362,19 @@ pub async fn run_stack(
             socket_state_changed = true;
         }
 
+        // Process read channels for all sockets (smoltcp -> app)
+        poll_read_channels(&mut sockets, &mut tcp_states, &mut udp_states);
+
         // Process pending operations that may now be completable
         if socket_state_changed {
             trace!("socket state changed");
-            process_pending(&mut sockets, &mut pending, &mut listeners);
+            process_pending(
+                &mut sockets,
+                &mut pending,
+                &mut listeners,
+                &mut tcp_states,
+                &write_notify,
+            );
         }
     }
 }
@@ -303,6 +388,9 @@ fn handle_command(
     pending: &mut PendingOps,
     listeners: &mut Listeners,
     config: &StackConfig,
+    tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
+    udp_states: &mut HashMap<SocketHandle, UdpSocketState>,
+    write_notify: &Arc<Notify>,
 ) -> bool {
     match cmd {
         StackCommand::TcpConnect {
@@ -310,7 +398,17 @@ fn handle_command(
             addr,
             response,
         } => {
-            handle_tcp_connect(local_ip, addr, iface, sockets, pending, config, response);
+            handle_tcp_connect(
+                local_ip,
+                addr,
+                iface,
+                sockets,
+                pending,
+                config,
+                tcp_states,
+                write_notify,
+                response,
+            );
         }
         StackCommand::TcpListen {
             addr,
@@ -320,44 +418,27 @@ fn handle_command(
             handle_tcp_listen(addr, backlog, sockets, listeners, response);
         }
         StackCommand::TcpAccept { handle, response } => {
-            handle_tcp_accept(handle, sockets, listeners, pending, response);
+            handle_tcp_accept(
+                handle,
+                sockets,
+                listeners,
+                pending,
+                tcp_states,
+                write_notify,
+                response,
+            );
         }
         StackCommand::TcpListenerClose { handle } => {
             handle_tcp_listener_close(handle, sockets, listeners, pending);
         }
-        StackCommand::TcpSend {
-            handle,
-            data,
-            response,
-        } => {
-            handle_tcp_send(handle, data, sockets, pending, response);
-        }
-        StackCommand::TcpRecv {
-            handle,
-            max_len,
-            response,
-        } => {
-            handle_tcp_recv(handle, max_len, sockets, pending, response);
-        }
         StackCommand::TcpClose { handle } => {
-            handle_tcp_close(handle, sockets, pending);
+            handle_tcp_close(handle, sockets, tcp_states);
         }
         StackCommand::UdpBind { addr, response } => {
-            handle_udp_bind(addr, sockets, response);
-        }
-        StackCommand::UdpSend {
-            handle,
-            dest,
-            data,
-            response,
-        } => {
-            handle_udp_send(handle, dest, data, sockets, response);
-        }
-        StackCommand::UdpRecv { handle, response } => {
-            handle_udp_recv(handle, sockets, pending, response);
+            handle_udp_bind(addr, sockets, udp_states, write_notify, response);
         }
         StackCommand::UdpClose { handle } => {
-            handle_udp_close(handle, sockets, pending);
+            handle_udp_close(handle, sockets, udp_states);
         }
         StackCommand::AddIp {
             ip,
@@ -383,7 +464,9 @@ fn handle_tcp_connect(
     sockets: &mut SocketSet<'_>,
     pending: &mut PendingOps,
     config: &StackConfig,
-    response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
+    tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
+    write_notify: &Arc<Notify>,
+    response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
 ) {
     debug!("tcp_connect to {} from {:?}", addr, local_ip);
 
@@ -421,16 +504,21 @@ fn handle_tcp_connect(
 
     trace!("tcp_connect initiated: handle={:?}", handle);
 
+    // Create channels for this socket (will be returned when connection completes)
+    let (channels, state) = create_tcp_channels(Arc::clone(write_notify));
+    tcp_states.insert(handle, state);
+
     // Construct local and peer addresses for later
     let local_addr = SocketAddr::V4(SocketAddrV4::new(source_ip, local_port));
     let peer_addr = addr;
 
-    // Store pending connect with address info
+    // Store pending connect with address info and channels
     pending.insert(
         handle,
         PendingOp::TcpConnect {
             local_addr,
             peer_addr,
+            channels,
             response,
         },
     );
@@ -534,7 +622,9 @@ fn handle_tcp_accept(
     sockets: &mut SocketSet<'_>,
     listeners: &mut Listeners,
     pending: &mut PendingOps,
-    response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr)>,
+    tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
+    write_notify: &Arc<Notify>,
+    response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
 ) {
     trace!("tcp_accept on handle={:?}", handle);
 
@@ -551,8 +641,11 @@ fn handle_tcp_accept(
     };
 
     // Check if any listening socket has become established
-    if let Some(result) = try_accept(sockets, state) {
-        let _ = response.send(Ok(result));
+    if let Some((accepted_handle, local, peer)) = try_accept_socket(sockets, state) {
+        // Create channels for the accepted socket
+        let (channels, socket_state) = create_tcp_channels(Arc::clone(write_notify));
+        tcp_states.insert(accepted_handle, socket_state);
+        let _ = response.send(Ok((accepted_handle, local, peer, channels)));
         return;
     }
 
@@ -564,7 +657,7 @@ fn handle_tcp_accept(
 /// Try to accept a connection from one of the listener's sockets.
 /// If successful, returns the accepted socket handle, local address, and peer address,
 /// and spawns a replacement listening socket.
-fn try_accept(
+fn try_accept_socket(
     sockets: &mut SocketSet<'_>,
     state: &mut ListenerState,
 ) -> Option<(SocketHandle, SocketAddr, SocketAddr)> {
@@ -666,107 +759,23 @@ fn handle_tcp_listener_close(
     }
 }
 
-fn handle_tcp_send(
+fn handle_tcp_close(
     handle: SocketHandle,
-    data: Vec<u8>,
     sockets: &mut SocketSet<'_>,
-    pending: &mut PendingOps,
-    response: ResponseSender<usize>,
+    tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
 ) {
-    trace!("tcp_send: {} bytes", data.len());
-    let socket = sockets.get_mut::<tcp::Socket>(handle);
-
-    if !socket.may_send() {
-        trace!("tcp_send: socket not connected");
-        let _ = response.send(Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "socket not connected",
-        )));
-        return;
-    }
-
-    // Try to send immediately
-    match socket.send_slice(&data) {
-        Ok(n) if n == data.len() => {
-            trace!("tcp_send: sent {} bytes", n);
-            let _ = response.send(Ok(n));
-        }
-        Ok(n) => {
-            trace!("tcp_send: partial send {}/{}, queuing", n, data.len());
-            // Partial send - queue remainder
-            pending.insert(
-                handle,
-                PendingOp::TcpSend {
-                    data,
-                    offset: n,
-                    response,
-                },
-            );
-        }
-        Err(e) => {
-            trace!("tcp_send: failed {:?}, queuing", e);
-            // Queue for later
-            pending.insert(
-                handle,
-                PendingOp::TcpSend {
-                    data,
-                    offset: 0,
-                    response,
-                },
-            );
-        }
-    }
-}
-
-fn handle_tcp_recv(
-    handle: SocketHandle,
-    max_len: usize,
-    sockets: &mut SocketSet<'_>,
-    pending: &mut PendingOps,
-    response: ResponseSender<Vec<u8>>,
-) {
-    trace!("tcp_recv: max_len={}", max_len);
-    let socket = sockets.get_mut::<tcp::Socket>(handle);
-
-    // Try to receive immediately
-    if socket.can_recv() {
-        let mut buf = vec![0u8; max_len];
-        match socket.recv_slice(&mut buf) {
-            Ok(n) => {
-                trace!("tcp_recv: got {} bytes", n);
-                buf.truncate(n);
-                let _ = response.send(Ok(buf));
-                return;
-            }
-            Err(e) => {
-                trace!("tcp_recv: immediate recv failed {:?}", e);
-            }
-        }
-    }
-
-    // Check for closed connection
-    if !socket.may_recv() {
-        trace!("tcp_recv: socket closed, sending EOF");
-        let _ = response.send(Ok(vec![])); // EOF
-        return;
-    }
-
-    trace!("tcp_recv: queuing for later");
-    // Queue for later
-    pending.insert(handle, PendingOp::TcpRecv { max_len, response });
-}
-
-fn handle_tcp_close(handle: SocketHandle, sockets: &mut SocketSet<'_>, pending: &mut PendingOps) {
     let socket = sockets.get_mut::<tcp::Socket>(handle);
     socket.close();
-    pending.remove(&handle);
+    tcp_states.remove(&handle);
     debug!("TCP closing: handle={:?}", handle);
 }
 
 fn handle_udp_bind(
     addr: SocketAddr,
     sockets: &mut SocketSet<'_>,
-    response: ResponseSender<(SocketHandle, SocketAddr)>,
+    udp_states: &mut HashMap<SocketHandle, UdpSocketState>,
+    write_notify: &Arc<Notify>,
+    response: ResponseSender<(SocketHandle, SocketAddr, UdpChannels)>,
 ) {
     debug!("udp_bind: addr={}", addr);
 
@@ -825,57 +834,23 @@ fn handle_udp_bind(
     }
 
     let handle = sockets.add(socket);
+
+    // Create channels for this socket
+    let (channels, state) = create_udp_channels(Arc::clone(write_notify));
+    udp_states.insert(handle, state);
+
     debug!("UDP bound: handle={:?}, addr={}", handle, bound_addr);
-    let _ = response.send(Ok((handle, bound_addr)));
+    let _ = response.send(Ok((handle, bound_addr, channels)));
 }
 
-fn handle_udp_send(
-    handle: SocketHandle,
-    dest: SocketAddr,
-    data: Vec<u8>,
-    sockets: &mut SocketSet<'_>,
-    response: ResponseSender<usize>,
-) {
-    let socket = sockets.get_mut::<udp::Socket>(handle);
-    let endpoint = socket_addr_to_endpoint(dest);
-
-    match socket.send_slice(&data, endpoint) {
-        Ok(()) => {
-            let _ = response.send(Ok(data.len()));
-        }
-        Err(e) => {
-            let _ = response.send(Err(io::Error::other(format!("send failed: {}", e))));
-        }
-    }
-}
-
-fn handle_udp_recv(
+fn handle_udp_close(
     handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
-    pending: &mut PendingOps,
-    response: ResponseSender<(Vec<u8>, SocketAddr)>,
+    udp_states: &mut HashMap<SocketHandle, UdpSocketState>,
 ) {
-    let socket = sockets.get_mut::<udp::Socket>(handle);
-
-    // Try to receive immediately
-    if socket.can_recv() {
-        let mut buf = vec![0u8; UDP_PACKET_BUFFER_SIZE];
-        if let Ok((n, meta)) = socket.recv_slice(&mut buf) {
-            buf.truncate(n);
-            let addr = endpoint_to_socket_addr(meta.endpoint);
-            let _ = response.send(Ok((buf, addr)));
-            return;
-        }
-    }
-
-    // Queue for later
-    pending.insert(handle, PendingOp::UdpRecv(response));
-}
-
-fn handle_udp_close(handle: SocketHandle, sockets: &mut SocketSet<'_>, pending: &mut PendingOps) {
     let socket = sockets.get_mut::<udp::Socket>(handle);
     socket.close();
-    pending.remove(&handle);
+    udp_states.remove(&handle);
     debug!("UDP closed: handle={:?}", handle);
 }
 
@@ -942,11 +917,149 @@ fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<Ipv4WithPrefi
     let _ = response.send(ips);
 }
 
+/// Poll all write channels and send data to smoltcp.
+/// Uses try_recv which is cheap if channel is empty.
+fn poll_write_channels(
+    sockets: &mut SocketSet<'_>,
+    tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
+    udp_states: &mut HashMap<SocketHandle, UdpSocketState>,
+) {
+    // Process TCP write channels
+    for (&handle, state) in tcp_states.iter_mut() {
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        process_tcp_write(socket, state);
+    }
+
+    // Process UDP write channels
+    for (&handle, state) in udp_states.iter_mut() {
+        let socket = sockets.get_mut::<udp::Socket>(handle);
+        process_udp_write(socket, state);
+    }
+}
+
+/// Poll all read channels and receive data from smoltcp.
+fn poll_read_channels(
+    sockets: &mut SocketSet<'_>,
+    tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
+    udp_states: &mut HashMap<SocketHandle, UdpSocketState>,
+) {
+    // Process TCP read channels
+    for (&handle, state) in tcp_states.iter_mut() {
+        let socket = sockets.get_mut::<tcp::Socket>(handle);
+        process_tcp_read(socket, state);
+    }
+
+    // Process UDP read channels
+    for (&handle, state) in udp_states.iter_mut() {
+        let socket = sockets.get_mut::<udp::Socket>(handle);
+        process_udp_read(socket, state);
+    }
+}
+
+/// Process TCP write path: pull data from channel and send to smoltcp.
+fn process_tcp_write(socket: &mut tcp::Socket, state: &mut TcpSocketState) {
+    // First, try to send any pending partial write
+    if let Some(pending) = state.pending_write.take() {
+        if socket.may_send() {
+            match socket.send_slice(&pending) {
+                Ok(n) if n < pending.len() => {
+                    state.pending_write = Some(pending[n..].to_vec());
+                    return; // Buffer full, wait for waker
+                }
+                Ok(_) => {}       // Fully sent, continue
+                Err(_) => return, // Error, will be detected on read
+            }
+        } else {
+            state.pending_write = Some(pending);
+            return;
+        }
+    }
+
+    // Pull new data from channel
+    while socket.can_send() {
+        match state.write_rx.try_recv() {
+            Ok(data) => match socket.send_slice(&data) {
+                Ok(n) if n < data.len() => {
+                    state.pending_write = Some(data[n..].to_vec());
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            },
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                // Socket dropped, initiate close
+                socket.close();
+                break;
+            }
+        }
+    }
+}
+
+/// Process TCP read path: receive data from smoltcp and push to channel.
+fn process_tcp_read(socket: &mut tcp::Socket, state: &mut TcpSocketState) {
+    while socket.can_recv() {
+        // Check if channel has capacity
+        match state.read_tx.try_reserve() {
+            Ok(permit) => {
+                let mut buf = vec![0u8; TCP_SOCKET_BUFFER_SIZE];
+                match socket.recv_slice(&mut buf) {
+                    Ok(n) if n > 0 => {
+                        buf.truncate(n);
+                        permit.send(buf);
+                    }
+                    _ => break,
+                }
+            }
+            Err(_) => break, // Channel full, backpressure
+        }
+    }
+}
+
+/// Process UDP write path: pull data from channel and send to smoltcp.
+fn process_udp_write(socket: &mut udp::Socket, state: &mut UdpSocketState) {
+    while socket.can_send() {
+        match state.write_rx.try_recv() {
+            Ok((data, dest)) => {
+                let endpoint = socket_addr_to_endpoint(dest);
+                let _ = socket.send_slice(&data, endpoint);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                socket.close();
+                break;
+            }
+        }
+    }
+}
+
+/// Process UDP read path: receive data from smoltcp and push to channel.
+fn process_udp_read(socket: &mut udp::Socket, state: &mut UdpSocketState) {
+    while socket.can_recv() {
+        match state.read_tx.try_reserve() {
+            Ok(permit) => {
+                let mut buf = vec![0u8; UDP_PACKET_BUFFER_SIZE];
+                match socket.recv_slice(&mut buf) {
+                    Ok((n, meta)) => {
+                        buf.truncate(n);
+                        let addr = endpoint_to_socket_addr(meta.endpoint);
+                        permit.send((buf, addr));
+                    }
+                    Err(_) => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 /// Process pending operations that may now be completable.
 fn process_pending(
     sockets: &mut SocketSet<'_>,
     pending: &mut PendingOps,
     listeners: &mut Listeners,
+    tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
+    write_notify: &Arc<Notify>,
 ) {
     let handles: Vec<_> = pending.keys().cloned().collect();
 
@@ -961,10 +1074,11 @@ fn process_pending(
                         if let Some(PendingOp::TcpConnect {
                             local_addr,
                             peer_addr,
+                            channels,
                             response,
                         }) = pending.remove(&handle)
                         {
-                            let _ = response.send(Ok((handle, local_addr, peer_addr)));
+                            let _ = response.send(Ok((handle, local_addr, peer_addr, channels)));
                         }
                         true
                     }
@@ -976,6 +1090,8 @@ fn process_pending(
                         if let Some(PendingOp::TcpConnect { response, .. }) =
                             pending.remove(&handle)
                         {
+                            // Remove the socket state since connection failed
+                            tcp_states.remove(&handle);
                             let _ = response.send(Err(io::Error::new(
                                 io::ErrorKind::ConnectionRefused,
                                 "connection failed",
@@ -989,11 +1105,14 @@ fn process_pending(
             Some(PendingOp::TcpAccept { .. }) => {
                 // Check if we have a listener for this handle and try to accept
                 if let Some(state) = listeners.get_mut(&handle) {
-                    if let Some(result) = try_accept(sockets, state) {
-                        if let Some(PendingOp::TcpAccept { response, .. }) =
-                            pending.remove(&handle)
-                        {
-                            let _ = response.send(Ok(result));
+                    if let Some((accepted_handle, local, peer)) = try_accept_socket(sockets, state)
+                    {
+                        if let Some(PendingOp::TcpAccept { response }) = pending.remove(&handle) {
+                            // Create channels for the accepted socket
+                            let (channels, socket_state) =
+                                create_tcp_channels(Arc::clone(write_notify));
+                            tcp_states.insert(accepted_handle, socket_state);
+                            let _ = response.send(Ok((accepted_handle, local, peer, channels)));
                         }
                         true
                     } else {
@@ -1001,103 +1120,13 @@ fn process_pending(
                     }
                 } else {
                     // Listener was closed, fail the pending accept
-                    if let Some(PendingOp::TcpAccept { response, .. }) = pending.remove(&handle) {
+                    if let Some(PendingOp::TcpAccept { response }) = pending.remove(&handle) {
                         let _ = response.send(Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "listener closed",
                         )));
                     }
                     true
-                }
-            }
-            Some(PendingOp::TcpSend { .. }) => {
-                let socket = sockets.get_mut::<tcp::Socket>(handle);
-                if socket.may_send() {
-                    if let Some(PendingOp::TcpSend {
-                        data,
-                        offset,
-                        response,
-                    }) = pending.remove(&handle)
-                    {
-                        match socket.send_slice(&data[offset..]) {
-                            Ok(n) => {
-                                let total = offset + n;
-                                if total < data.len() {
-                                    // Still more to send
-                                    pending.insert(
-                                        handle,
-                                        PendingOp::TcpSend {
-                                            data,
-                                            offset: total,
-                                            response,
-                                        },
-                                    );
-                                } else {
-                                    let _ = response.send(Ok(data.len()));
-                                }
-                            }
-                            Err(_) => {
-                                let _ = response.send(Err(io::Error::new(
-                                    io::ErrorKind::BrokenPipe,
-                                    "send failed",
-                                )));
-                            }
-                        }
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
-            Some(PendingOp::TcpRecv { .. }) => {
-                let socket = sockets.get_mut::<tcp::Socket>(handle);
-                if socket.can_recv() {
-                    if let Some(PendingOp::TcpRecv { max_len, response }) = pending.remove(&handle)
-                    {
-                        let mut buf = vec![0u8; max_len];
-                        match socket.recv_slice(&mut buf) {
-                            Ok(n) => {
-                                trace!("TCP recv: {} bytes", n);
-                                buf.truncate(n);
-                                let _ = response.send(Ok(buf));
-                            }
-                            Err(e) => {
-                                warn!("TCP recv error: {:?}", e);
-                                let _ = response.send(Err(io::Error::other("recv failed")));
-                            }
-                        }
-                    }
-                    true
-                } else if !socket.may_recv() {
-                    // Socket closed
-                    trace!("TCP recv: EOF");
-                    if let Some(PendingOp::TcpRecv { response, .. }) = pending.remove(&handle) {
-                        let _ = response.send(Ok(vec![])); // EOF
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
-            Some(PendingOp::UdpRecv(_)) => {
-                let socket = sockets.get_mut::<udp::Socket>(handle);
-                if socket.can_recv() {
-                    if let Some(PendingOp::UdpRecv(response)) = pending.remove(&handle) {
-                        let mut buf = vec![0u8; UDP_PACKET_BUFFER_SIZE];
-                        match socket.recv_slice(&mut buf) {
-                            Ok((n, meta)) => {
-                                buf.truncate(n);
-                                let addr = endpoint_to_socket_addr(meta.endpoint);
-                                let _ = response.send(Ok((buf, addr)));
-                            }
-                            Err(_) => {
-                                let _ = response.send(Err(io::Error::other("recv failed")));
-                            }
-                        }
-                    }
-                    true
-                } else {
-                    false
                 }
             }
             None => true,

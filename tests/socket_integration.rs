@@ -50,7 +50,7 @@ async fn test_tcp_connect_and_exchange() {
     // Connect to the server on the TAP interface IP
     let server_addr = format!("{}:18080", PEER_IP).parse().unwrap();
 
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
         .expect("failed to tcp_connect");
@@ -81,7 +81,7 @@ async fn test_tcp_multiple_messages() {
         .expect("failed to connect to namespace");
 
     let server_addr = format!("{}:18081", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
         .expect("failed to tcp_connect");
@@ -118,7 +118,7 @@ async fn test_tcp_multiple_connections() {
 
     // Create multiple connections sequentially
     for i in 0..3 {
-        let stream = tunnel
+        let mut stream = tunnel
             .tcp_connect(server_addr)
             .await
             .expect("failed to connect");
@@ -150,7 +150,7 @@ async fn test_tcp_large_transfer() {
         .expect("failed to connect to namespace");
 
     let server_addr = format!("{}:18083", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
         .expect("failed to connect");
@@ -214,7 +214,7 @@ async fn test_tcp_retransmission_with_packet_loss() {
         .expect("failed to connect to namespace");
 
     let server_addr: std::net::SocketAddr = format!("{}:18090", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
         .expect("failed to connect");
@@ -266,7 +266,7 @@ async fn test_udp_send_recv() {
 
     // Bind UDP socket on local address
     let local_bind: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
-    let socket = tunnel
+    let mut socket = tunnel
         .udp_bind(local_bind)
         .await
         .expect("failed to udp_bind");
@@ -298,7 +298,7 @@ async fn test_udp_multiple_messages() {
         .expect("failed to connect to namespace");
 
     let local_bind: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
-    let socket = tunnel
+    let mut socket = tunnel
         .udp_bind(local_bind)
         .await
         .expect("failed to udp_bind");
@@ -369,7 +369,7 @@ async fn test_socket_path_mode_tcp() {
 
     // Connect to the TCP server
     let server_addr = format!("{}:18100", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
         .expect("failed to tcp_connect");
@@ -424,7 +424,7 @@ async fn test_socket_path_mode_requested_ip() {
 
     // Connect to the TCP server
     let server_addr = format!("{}:18101", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
         .expect("failed to tcp_connect");
@@ -472,7 +472,7 @@ async fn test_tcp_listen_accept() {
     // Accept connection from client in namespace
     let accept_result = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
 
-    let (stream, peer_addr) = accept_result
+    let (mut stream, peer_addr) = accept_result
         .expect("accept timed out")
         .expect("accept failed");
 
@@ -514,7 +514,7 @@ async fn test_tcp_listen_multiple_accepts() {
     for i in 0..3 {
         let accept_result = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
 
-        let (stream, _peer_addr) = accept_result
+        let (mut stream, _peer_addr) = accept_result
             .unwrap_or_else(|_| panic!("accept {} timed out", i))
             .unwrap_or_else(|_| panic!("accept {} failed", i));
 
@@ -559,7 +559,7 @@ async fn test_tcp_listen_with_backlog() {
         let accept_result = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
 
         match accept_result {
-            Ok(Ok((stream, _peer_addr))) => {
+            Ok(Ok((mut stream, _peer_addr))) => {
                 accepted += 1;
                 // Read and echo back
                 let mut buf = [0u8; 64];
@@ -642,7 +642,7 @@ async fn test_tunnel_server_echo() {
         .expect("failed to listen");
 
     // Accept and implement echo server
-    let (stream, peer) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    let (mut stream, peer) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
         .await
         .expect("accept timed out")
         .expect("accept failed");
@@ -672,7 +672,7 @@ async fn test_tunnel_client_request_response() {
         .await
         .expect("failed to connect");
 
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(format!("{}:19101", PEER_IP).parse().unwrap())
         .await
         .expect("failed to connect");
@@ -705,7 +705,7 @@ async fn test_tunnel_server_multi_exchange() {
         .await
         .expect("failed to listen");
 
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
         .await
         .expect("accept timed out")
         .expect("accept failed");
@@ -737,7 +737,7 @@ async fn test_tunnel_client_large_bidirectional() {
         .await
         .expect("failed to connect");
 
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(format!("{}:19103", PEER_IP).parse().unwrap())
         .await
         .expect("failed to connect");
@@ -789,14 +789,14 @@ async fn test_tunnel_server_large_bidirectional() {
         .await
         .expect("failed to listen");
 
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
         .await
         .expect("accept timed out")
         .expect("accept failed");
 
     // Read all data from client
     let mut received = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while received.len() < 32768 {
         if tokio::time::Instant::now() > deadline {
             panic!("timeout reading from client: got {} bytes", received.len());
@@ -833,7 +833,7 @@ async fn test_tunnel_concurrent_clients() {
     for i in 0..3 {
         let tunnel = tunnel.clone();
         let handle = tokio::spawn(async move {
-            let stream = tunnel
+            let mut stream = tunnel
                 .tcp_connect(format!("{}:19105", PEER_IP).parse().unwrap())
                 .await?;
 
@@ -984,7 +984,7 @@ async fn test_tunnel_tcp_connect_from() {
 
     // Connect from the default local IP using tcp_connect_from
     let server_addr = format!("{}:19203", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect_from(LOCAL_IP, server_addr)
         .await
         .expect("failed to tcp_connect_from");
@@ -1028,7 +1028,7 @@ async fn test_tunnel_tcp_connect_from_added_ip() {
 
     // Connect from the new IP
     let server_addr = format!("{}:19204", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect_from(new_ip, server_addr)
         .await
         .expect("failed to tcp_connect_from new IP");
@@ -1087,7 +1087,7 @@ async fn test_tunnel_multi_ip_connections() {
 
     // Connect from each IP and verify they all work
     for (i, ip) in [LOCAL_IP, ip2, ip3].iter().enumerate() {
-        let stream = tunnel
+        let mut stream = tunnel
             .tcp_connect_from(*ip, server_addr)
             .await
             .unwrap_or_else(|e| panic!("failed to connect from {}: {}", ip, e));
@@ -1129,7 +1129,7 @@ async fn test_tcp_local_addr_peer_addr() {
         .expect("failed to connect to namespace");
 
     let server_addr: std::net::SocketAddr = format!("{}:19300", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
         .expect("failed to tcp_connect");
@@ -1174,7 +1174,10 @@ async fn test_udp_local_addr_ephemeral() {
 
     // Bind to port 0 to get an ephemeral port
     let bind_addr: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
-    let socket = tunnel.udp_bind(bind_addr).await.expect("failed to udp_bind");
+    let mut socket = tunnel
+        .udp_bind(bind_addr)
+        .await
+        .expect("failed to udp_bind");
 
     // local_addr should have the actual allocated port, not 0
     let local_addr = socket.local_addr();
@@ -1256,6 +1259,7 @@ async fn test_tcp_into_split() {
     });
 
     let read_task = tokio::spawn(async move {
+        let mut read_half = read_half;
         let mut total = Vec::new();
         for _ in 0..3 {
             let mut buf = [0u8; 64];
@@ -1366,7 +1370,7 @@ async fn test_socket_path_mode_gateway() {
 
     // Verify connectivity still works
     let server_addr = format!("{}:19206", PEER_IP).parse().unwrap();
-    let stream = tunnel
+    let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
         .expect("connect failed");
@@ -1380,4 +1384,130 @@ async fn test_socket_path_mode_gateway() {
     assert_eq!(&buf[..n], b"gateway test\n");
 
     let _ = std::fs::remove_file(&socket_path);
+}
+
+/// Test AsyncRead/AsyncWrite traits with tokio's copy utility.
+#[tokio::test]
+async fn test_tcp_async_read_write_traits() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19400).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let server_addr = format!("{}:19400", PEER_IP).parse().unwrap();
+    let mut stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    // Test AsyncWriteExt methods
+    stream
+        .write_all(b"hello from async traits\n")
+        .await
+        .expect("AsyncWriteExt::write_all failed");
+
+    stream.flush().await.expect("AsyncWriteExt::flush failed");
+
+    // Test AsyncReadExt methods
+    let mut buf = vec![0u8; 64];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .expect("AsyncReadExt::read failed");
+
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.contains("hello from async traits"),
+        "should echo back: {}",
+        response
+    );
+
+    // Test read_exact
+    stream
+        .write_all(b"exact test\n")
+        .await
+        .expect("write failed");
+
+    let mut exact_buf = [0u8; 10];
+    stream
+        .read_exact(&mut exact_buf)
+        .await
+        .expect("AsyncReadExt::read_exact failed");
+    assert_eq!(&exact_buf, b"exact test");
+}
+
+/// Test AsyncRead/AsyncWrite traits work with split halves.
+#[tokio::test]
+async fn test_tcp_split_async_traits() {
+    use tokio::io::AsyncWriteExt;
+
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19401).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let server_addr = format!("{}:19401", PEER_IP).parse().unwrap();
+    let stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    let (read_half, write_half) = stream.into_split();
+
+    // Use tokio::spawn to exercise the traits in concurrent tasks
+    let write_task = tokio::spawn(async move {
+        let mut write_half = write_half;
+        for i in 0..5 {
+            let msg = format!("async trait msg {}\n", i);
+            write_half.write_all(msg.as_bytes()).await.unwrap();
+            write_half.flush().await.unwrap();
+        }
+        write_half
+    });
+
+    let read_task = tokio::spawn(async move {
+        let mut read_half = read_half;
+        let mut all_data = Vec::new();
+        let mut buf = [0u8; 128];
+        // Read until we have all 5 messages
+        while all_data.len() < 80 {
+            // Each message is ~18 bytes
+            match tokio::time::timeout(Duration::from_secs(2), read_half.read(&mut buf)).await {
+                Ok(Ok(0)) => break, // EOF
+                Ok(Ok(n)) => all_data.extend_from_slice(&buf[..n]),
+                Ok(Err(e)) => panic!("read error: {}", e),
+                Err(_) => break, // Timeout - we probably have enough
+            }
+        }
+        (read_half, all_data)
+    });
+
+    let _write_half = write_task.await.expect("write task panicked");
+    let (_read_half, data) = read_task.await.expect("read task panicked");
+
+    let data_str = String::from_utf8_lossy(&data);
+
+    // Verify we received all messages
+    for i in 0..5 {
+        assert!(
+            data_str.contains(&format!("async trait msg {}", i)),
+            "should contain msg {}: {}",
+            i,
+            data_str
+        );
+    }
 }

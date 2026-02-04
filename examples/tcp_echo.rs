@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Connected to tunnel");
 
     info!("Connecting to {}...", target_addr);
-    let stream = tunnel.tcp_connect(target_addr).await?;
+    let mut stream = tunnel.tcp_connect(target_addr).await?;
     info!("Connected!");
 
     // Read from stdin and send to the server

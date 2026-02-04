@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind UDP socket on our local address
     let local_bind: std::net::SocketAddr = "10.0.0.2:0".parse()?;
     info!("Binding UDP socket to {}...", local_bind);
-    let socket = tunnel.udp_bind(local_bind).await?;
+    let mut socket = tunnel.udp_bind(local_bind).await?;
     info!("Bound! Target: {}", target_addr);
 
     // Read from stdin and send to the target

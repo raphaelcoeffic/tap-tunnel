@@ -49,12 +49,12 @@ User async code (tokio)
     ↓
 Tunnel API (tcp_connect, udp_bind)
     ↓ tokio mpsc channels
-smoltcp Stack Thread (blocking)
+smoltcp Stack Task (async)
     ├─ Interface + SocketSet
     ├─ Poll loop with 1ms tick
     └─ ProxyDevice
     ↓ Unix SEQPACKET socketpair
-IPC Reader/Writer Threads  ←──────────→  tap-tunnel-proxy binary
+IPC Reader/Writer Tasks   ←──────────→  tap-tunnel-proxy binary
                                             ├─ Joins user+net namespaces
                                             ├─ Creates TAP device
                                             └─ Relays Ethernet frames
@@ -70,7 +70,7 @@ IPC Reader/Writer Threads  ←──────────→  tap-tunnel-prox
 - **`src/lib.rs`**: `Tunnel` and `TapConfig` API, proxy binary discovery/spawning, IPC thread setup
 - **`src/stack/mod.rs`**: smoltcp integration - `run_stack()` poll loop, `StackCommand` enum for socket operations, pending operation handling
 - **`src/stack/device.rs`**: `ProxyDevice` implementing smoltcp's `Device` trait over channels
-- **`src/socket/`**: `TcpStream` and `UdpSocket` async wrappers that send commands to the stack thread
+- **`src/socket/`**: `TcpStream` and `UdpSocket` async wrappers that send commands to the stack task
 - **`proxy/src/main.rs`**: Proxy binary - joins target namespace, creates TAP device, relays Ethernet frames
 - **`proxy/src/namespace.rs`**: `join_namespace(pid)` - joins user namespace first, then network namespace
 - **`proxy/src/tap.rs`**: TAP device creation via `/dev/net/tun` ioctl

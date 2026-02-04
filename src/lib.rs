@@ -17,7 +17,7 @@
 //! │  └──────────────────┬───────────────────────────────┘   │
 //! │                     │ channels                          │
 //! │  ┌──────────────────▼───────────────────────────────┐   │
-//! │  │         smoltcp Stack Thread (blocking)          │   │
+//! │  │           smoltcp Stack Task (async)             │   │
 //! │  │   Interface + Sockets + poll() loop              │   │
 //! │  └──────────────────┬───────────────────────────────┘   │
 //! │                     │ ProxyDevice (impl Device)         │
@@ -193,7 +193,7 @@ impl TapConfig {
 ///
 /// The tunnel is established by:
 /// 1. Spawning a TAP proxy process that joins the target namespace
-/// 2. Running a smoltcp stack thread that handles protocol processing
+/// 2. Running a smoltcp stack task that handles protocol processing
 ///
 /// This type is cloneable and can be shared between tasks.
 pub struct Tunnel {
@@ -201,7 +201,7 @@ pub struct Tunnel {
 }
 
 struct TunnelInner {
-    /// Channel to send commands to the stack thread
+    /// Channel to send commands to the stack task
     commands: CommandSender,
     /// TAP proxy child process (None when using socket-path mode)
     proxy_child: Mutex<Option<Child>>,
@@ -222,11 +222,11 @@ impl Drop for TunnelInner {
             let _ = child.wait();
         }
 
-        // The stack thread will exit when:
+        // The stack task will exit when:
         // 1. self.commands is dropped (after this method returns), disconnecting the channel
         // 2. The stack detects TryRecvError::Disconnected and returns
         // We intentionally don't join() to avoid blocking the async runtime.
-        // The thread will clean up on its own.
+        // The task will clean up on its own.
     }
 }
 
@@ -366,7 +366,7 @@ impl Tunnel {
 
     /// Connect to the network namespace of the given PID with custom configuration.
     ///
-    /// This spawns a TAP proxy process and starts a smoltcp stack thread.
+    /// This spawns a TAP proxy process and starts a smoltcp stack task.
     pub async fn connect_with_config(pid: u32, config: TapConfig) -> io::Result<Self> {
         Self::connect_with_config_blocking(pid, config)
     }
@@ -520,7 +520,7 @@ impl Tunnel {
         Self::setup_stack_from_fd(stream, config, None, gateway)
     }
 
-    /// Common setup code: given a connected frame FD, set up channels, IPC threads, and stack.
+    /// Common setup code: given a connected frame FD, set up channels, IPC tasks, and stack.
     ///
     /// Messages are prefixed with a type byte (0x00=control, 0x01=frame).
     fn setup_stack_from_fd(
@@ -574,7 +574,7 @@ impl Tunnel {
             use protocol::{Message, decode_message};
             use tokio::io::AsyncReadExt;
 
-            debug!("[IPC-RX] reader thread starting");
+            debug!("[IPC-RX] reader task starting");
             let mut buf = [0u8; IPC_READ_BUFFER_SIZE];
             while let Ok(n) = ipc_read_stream.read(&mut buf).await {
                 if n == 0 {
@@ -594,12 +594,12 @@ impl Tunnel {
             }
         });
 
-        // Spawn IPC writer thread (stack -> proxy)
+        // Spawn IPC writer task (stack -> proxy)
         tokio::spawn(async move {
             use protocol::encode_frame;
             use tokio::io::AsyncWriteExt;
 
-            debug!("[IPC-TX] writer thread starting");
+            debug!("[IPC-TX] writer task starting");
             while let Some(frame) = frame_to_proxy_rx.recv().await {
                 let msg = encode_frame(&frame);
                 if ipc_write_stream.write_all(&msg).await.is_err() {
@@ -642,10 +642,10 @@ impl Tunnel {
                 response: tx,
             })
             .await
-            .map_err(|_| broken_pipe("stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack task gone"))?;
 
         let (handle, local_addr, peer_addr) =
-            rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
+            rx.await.map_err(|_| broken_pipe("stack task gone"))??;
 
         Ok(TcpStream::from_handle(
             handle,
@@ -704,9 +704,9 @@ impl Tunnel {
                 response: tx,
             })
             .await
-            .map_err(|_| broken_pipe("stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack task gone"))?;
 
-        let (handle, local_addr) = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
+        let (handle, local_addr) = rx.await.map_err(|_| broken_pipe("stack task gone"))??;
 
         Ok(TcpListener::from_handle(
             handle,
@@ -723,9 +723,9 @@ impl Tunnel {
             .commands
             .send(StackCommand::UdpBind { addr, response: tx })
             .await
-            .map_err(|_| broken_pipe("stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack task gone"))?;
 
-        let (handle, local_addr) = rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
+        let (handle, local_addr) = rx.await.map_err(|_| broken_pipe("stack task gone"))??;
 
         Ok(UdpSocket::from_handle(
             handle,
@@ -753,10 +753,10 @@ impl Tunnel {
                 response: tx,
             })
             .await
-            .map_err(|_| broken_pipe("stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack task gone"))?;
 
         let (handle, local_addr, peer_addr) =
-            rx.await.map_err(|_| broken_pipe("stack thread gone"))??;
+            rx.await.map_err(|_| broken_pipe("stack task gone"))??;
 
         Ok(TcpStream::from_handle(
             handle,
@@ -781,9 +781,9 @@ impl Tunnel {
                 response: tx,
             })
             .await
-            .map_err(|_| broken_pipe("stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack task gone"))?;
 
-        rx.await.map_err(|_| broken_pipe("stack thread gone"))?
+        rx.await.map_err(|_| broken_pipe("stack task gone"))?
     }
 
     /// Remove a local IP address from the smoltcp interface.
@@ -794,9 +794,9 @@ impl Tunnel {
             .commands
             .send(StackCommand::RemoveIp { ip, response: tx })
             .await
-            .map_err(|_| broken_pipe("stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack task gone"))?;
 
-        rx.await.map_err(|_| broken_pipe("stack thread gone"))?
+        rx.await.map_err(|_| broken_pipe("stack task gone"))?
     }
 
     /// Get current local IP addresses on the smoltcp interface.
@@ -809,9 +809,9 @@ impl Tunnel {
             .commands
             .send(StackCommand::GetIps { response: tx })
             .await
-            .map_err(|_| broken_pipe("stack thread gone"))?;
+            .map_err(|_| broken_pipe("stack task gone"))?;
 
-        rx.await.map_err(|_| broken_pipe("stack thread gone"))
+        rx.await.map_err(|_| broken_pipe("stack task gone"))
     }
 
     /// Local IP (first IP added to the interface)

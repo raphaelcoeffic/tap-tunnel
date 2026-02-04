@@ -68,7 +68,7 @@ type PendingOps = HashMap<SocketHandle, PendingOp>;
 /// Map of listener handles to their state.
 type Listeners = HashMap<SocketHandle, ListenerState>;
 
-/// Commands sent from async socket handles to the stack thread.
+/// Commands sent from async socket handles to the stack task.
 pub enum StackCommand {
     /// Create a TCP socket and initiate connection.
     /// Returns (handle, local_addr, peer_addr) on success.

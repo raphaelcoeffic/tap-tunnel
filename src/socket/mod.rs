@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// A TCP stream connected to a remote endpoint.
 ///
 /// This provides an async read/write interface similar to `tokio::net::TcpStream`,
-/// but backed by smoltcp running in a dedicated thread.
+/// but backed by smoltcp running as an async task.
 pub struct TcpStream {
     handle: SocketHandle,
     commands: CommandSender,
@@ -60,11 +60,11 @@ impl TcpStream {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
 
         let data = rx
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))??;
 
         let len = data.len().min(buf.len());
         buf[..len].copy_from_slice(&data[..len]);
@@ -84,10 +84,10 @@ impl TcpStream {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
 
         rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?
     }
 
     /// Write all data to the stream.
@@ -194,11 +194,11 @@ impl OwnedReadHalf {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
 
         let data = rx
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))??;
 
         let len = data.len().min(buf.len());
         buf[..len].copy_from_slice(&data[..len]);
@@ -245,10 +245,10 @@ impl OwnedWriteHalf {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
 
         rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?
     }
 
     /// Write all data to the stream.
@@ -280,7 +280,7 @@ impl Drop for OwnedWriteHalf {
 /// A UDP socket.
 ///
 /// This provides an async send/recv interface similar to `tokio::net::UdpSocket`,
-/// but backed by smoltcp running in a dedicated thread.
+/// but backed by smoltcp running as an async task.
 pub struct UdpSocket {
     handle: SocketHandle,
     commands: CommandSender,
@@ -318,10 +318,10 @@ impl UdpSocket {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
 
         rx.await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?
     }
 
     /// Receive data and the source address.
@@ -334,11 +334,11 @@ impl UdpSocket {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
 
         let (data, addr) = rx
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))??;
 
         let len = data.len().min(buf.len());
         buf[..len].copy_from_slice(&data[..len]);
@@ -363,7 +363,7 @@ impl Drop for UdpSocket {
 /// A TCP listener that accepts incoming connections.
 ///
 /// This provides an async accept interface similar to `tokio::net::TcpListener`,
-/// but backed by smoltcp running in a dedicated thread.
+/// but backed by smoltcp running as an async task.
 pub struct TcpListener {
     handle: SocketHandle,
     local_addr: SocketAddr,
@@ -396,11 +396,11 @@ impl TcpListener {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
 
         let (stream_handle, local_addr, peer_addr) = rx
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack thread gone"))??;
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))??;
 
         Ok((
             TcpStream::from_handle(stream_handle, self.commands.clone(), local_addr, peer_addr),

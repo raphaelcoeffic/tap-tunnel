@@ -1325,50 +1325,6 @@ async fn test_tcp_split_drop_behavior() {
     drop(write_half);
 }
 
-// ============================================================================
-// AsyncRead/AsyncWrite Tests
-// ============================================================================
-
-/// Test AsyncRead/AsyncWrite traits using tokio::io utilities.
-#[tokio::test]
-async fn test_tcp_async_read_write_traits() {
-    use tokio::io::AsyncWriteExt;
-
-    init_logging();
-
-    let ns_proc = tcp_echo_server_ns(19303).expect("failed to create namespace");
-    let pid = ns_proc.pid();
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let tunnel = Tunnel::connect_with_config(pid, test_config())
-        .await
-        .expect("failed to connect to namespace");
-
-    let server_addr = format!("{}:19303", PEER_IP).parse().unwrap();
-    let mut stream = tunnel
-        .tcp_connect(server_addr)
-        .await
-        .expect("failed to tcp_connect");
-
-    // Use AsyncWriteExt
-    stream
-        .write_all(b"async trait test\n")
-        .await
-        .expect("async write failed");
-
-    // Use AsyncReadExt
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).await.expect("async read failed");
-    assert_eq!(&buf[..n], b"async trait test\n");
-
-    // Test flush (no-op but should succeed)
-    stream.flush().await.expect("flush failed");
-
-    // Test shutdown
-    stream.shutdown().await.expect("shutdown failed");
-}
-
 /// Test socket-path mode with gateway() API.
 #[tokio::test]
 async fn test_socket_path_mode_gateway() {

@@ -8,91 +8,7 @@ use crate::stack::StackCommand;
 use smoltcp::iface::SocketHandle;
 use std::io;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-
-/// Helper for poll_read implementations.
-fn poll_tcp_read(
-    handle: SocketHandle,
-    commands: &CommandSender,
-    cx: &mut Context<'_>,
-    buf: &mut ReadBuf<'_>,
-) -> Poll<io::Result<()>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-
-    match commands.try_send(StackCommand::TcpRecv {
-        handle,
-        max_len: buf.remaining(),
-        response: tx,
-    }) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stack thread gone",
-            )));
-        }
-    }
-
-    let mut rx = Box::pin(rx);
-    match rx.as_mut().poll(cx) {
-        Poll::Ready(Ok(Ok(data))) => {
-            buf.put_slice(&data);
-            Poll::Ready(Ok(()))
-        }
-        Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-        Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "stack thread gone",
-        ))),
-        Poll::Pending => Poll::Pending,
-    }
-}
-
-/// Helper for poll_write implementations.
-fn poll_tcp_write(
-    handle: SocketHandle,
-    commands: &CommandSender,
-    cx: &mut Context<'_>,
-    buf: &[u8],
-) -> Poll<io::Result<usize>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-
-    match commands.try_send(StackCommand::TcpSend {
-        handle,
-        data: buf.to_vec(),
-        response: tx,
-    }) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            cx.waker().wake_by_ref();
-            return Poll::Pending;
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stack thread gone",
-            )));
-        }
-    }
-
-    let mut rx = Box::pin(rx);
-    match rx.as_mut().poll(cx) {
-        Poll::Ready(Ok(Ok(n))) => Poll::Ready(Ok(n)),
-        Poll::Ready(Ok(Err(e))) => Poll::Ready(Err(e)),
-        Poll::Ready(Err(_)) => Poll::Ready(Err(io::Error::new(
-            io::ErrorKind::BrokenPipe,
-            "stack thread gone",
-        ))),
-        Poll::Pending => Poll::Pending,
-    }
-}
 
 /// A TCP stream connected to a remote endpoint.
 ///
@@ -205,35 +121,6 @@ impl Drop for TcpStream {
     }
 }
 
-impl AsyncRead for TcpStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        poll_tcp_read(self.handle, &self.commands, cx, buf)
-    }
-}
-
-impl AsyncWrite for TcpStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        poll_tcp_write(self.handle, &self.commands, cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.close();
-        Poll::Ready(Ok(()))
-    }
-}
-
 /// Splits a `TcpStream` into a read half and a write half, which can be used
 /// to read and write the stream concurrently.
 impl TcpStream {
@@ -328,16 +215,6 @@ impl Drop for OwnedReadHalf {
     }
 }
 
-impl AsyncRead for OwnedReadHalf {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        poll_tcp_read(self.inner.handle, &self.inner.commands, cx, buf)
-    }
-}
-
 /// The write half of a TCP stream after calling [`TcpStream::into_split`].
 pub struct OwnedWriteHalf {
     inner: Arc<TcpStreamInner>,
@@ -397,25 +274,6 @@ impl Drop for OwnedWriteHalf {
         if Arc::strong_count(&self.inner) == 1 {
             self.inner.close();
         }
-    }
-}
-
-impl AsyncWrite for OwnedWriteHalf {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        poll_tcp_write(self.inner.handle, &self.inner.commands, cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.inner.close();
-        Poll::Ready(Ok(()))
     }
 }
 

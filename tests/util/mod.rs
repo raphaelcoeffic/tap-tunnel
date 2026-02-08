@@ -3,7 +3,7 @@
 //! Common utility functions for integration tests.
 
 use std::io::Read;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -126,9 +126,9 @@ impl Drop for ProxyProcess {
 }
 
 /// Default TAP interface IP (peer side, in namespace)
-pub const PEER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+pub const PEER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 /// Default smoltcp stack IP (local side, in test process)
-pub const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+pub const LOCAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 /// Subnet prefix length
 pub const PREFIX_LEN: u8 = 24;
 

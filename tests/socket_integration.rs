@@ -19,7 +19,7 @@
 //! cargo test --test socket_integration
 //! ```
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use tap_tunnel::{TapConfig, Tunnel};
@@ -417,7 +417,7 @@ async fn test_socket_path_mode_requested_ip() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Connect with a requested IP
-    let requested_ip = std::net::Ipv4Addr::new(10, 0, 0, 5);
+    let requested_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
     let tunnel = Tunnel::connect_to(&socket_path, Some(requested_ip))
         .await
         .expect("failed to connect with requested IP");
@@ -921,7 +921,7 @@ async fn test_tunnel_add_remove_ip() {
     let initial_count = initial_ips.len();
 
     // Add a new IP
-    let new_ip = Ipv4Addr::new(10, 0, 0, 100);
+    let new_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 100));
     tunnel
         .add_local_ip(new_ip, PREFIX_LEN)
         .await
@@ -1013,7 +1013,7 @@ async fn test_tunnel_tcp_connect_from_added_ip() {
         .expect("failed to connect");
 
     // Add a new IP address
-    let new_ip = Ipv4Addr::new(10, 0, 0, 50);
+    let new_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 50));
     tunnel
         .add_local_ip(new_ip, PREFIX_LEN)
         .await
@@ -1057,8 +1057,8 @@ async fn test_tunnel_multi_ip_connections() {
         .expect("failed to connect");
 
     // Add two more IPs
-    let ip2 = Ipv4Addr::new(10, 0, 0, 20);
-    let ip3 = Ipv4Addr::new(10, 0, 0, 30);
+    let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 20));
+    let ip3 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 30));
     tunnel
         .add_local_ip(ip2, PREFIX_LEN)
         .await
@@ -1138,7 +1138,7 @@ async fn test_tcp_local_addr_peer_addr() {
     let local_addr = stream.local_addr();
     assert_eq!(
         local_addr.ip(),
-        std::net::IpAddr::V4(LOCAL_IP),
+        LOCAL_IP,
         "local IP should match"
     );
     assert!(local_addr.port() >= 49152, "local port should be ephemeral");
@@ -1183,7 +1183,7 @@ async fn test_udp_local_addr_ephemeral() {
     let local_addr = socket.local_addr();
     assert_eq!(
         local_addr.ip(),
-        std::net::IpAddr::V4(LOCAL_IP),
+        LOCAL_IP,
         "local IP should match"
     );
     assert!(

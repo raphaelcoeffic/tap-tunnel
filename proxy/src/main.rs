@@ -18,7 +18,7 @@
 use clap::Parser;
 use log::{debug, error, trace};
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -134,16 +134,20 @@ fn build_tap_config(args: &Args) -> TapConfig {
     config
 }
 
-fn parse_ip_prefix(s: &str) -> Option<(Ipv4Addr, u8)> {
+fn parse_ip_prefix(s: &str) -> Option<(IpAddr, u8)> {
     let parts: Vec<&str> = s.split('/').collect();
     if parts.len() != 2 {
         return None;
     }
 
-    let ip: Ipv4Addr = parts[0].parse().ok()?;
+    let ip: IpAddr = parts[0].parse().ok()?;
     let prefix: u8 = parts[1].parse().ok()?;
 
-    if prefix > 32 {
+    let max_prefix = match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
         return None;
     }
 
@@ -415,14 +419,14 @@ async fn run_proxy(
     // Wrap SEQPACKET socket in async wrapper
     let mut frame_socket = AsyncFdIo::new(frame_fd)?;
 
-    // Send gratuitous ARP to pre-fill peer's ARP cache and signal readiness
-    // In protocol mode, we need to prefix with type byte
-    if let Some((ip, _)) = config.peer_addr {
+    // Send gratuitous ARP to pre-fill peer's ARP cache (IPv4 only)
+    // IPv6 uses NDP (Neighbor Discovery Protocol) instead of ARP
+    if let Some((IpAddr::V4(ipv4), _)) = config.peer_addr {
         let broadcast_mac = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-        let arp_frame = build_gratuitous_arp(tap_mac, ip, broadcast_mac);
+        let arp_frame = build_gratuitous_arp(tap_mac, ipv4, broadcast_mac);
         let msg = encode_frame(&arp_frame);
         frame_socket.write_all(&msg).await?;
-        debug!("sent gratuitous ARP for {}", ip);
+        debug!("sent gratuitous ARP for {}", ipv4);
     }
 
     // Wrap TAP in async wrapper

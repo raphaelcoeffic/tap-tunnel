@@ -95,71 +95,24 @@ pub fn get_interface_mac(name: &str) -> io::Result<[u8; 6]> {
     Ok(mac)
 }
 
-/// Configure an IPv4 address on a network interface.
+/// Configure an IP address (IPv4 or IPv6) on a network interface.
+///
+/// Uses `ip addr add` command which handles both address families.
 pub fn configure_interface_ip(
     name: &str,
-    addr: std::net::Ipv4Addr,
+    addr: std::net::IpAddr,
     prefix_len: u8,
 ) -> io::Result<()> {
-    #[repr(C)]
-    struct IfReqAddr {
-        ifr_name: [libc::c_char; libc::IFNAMSIZ],
-        ifr_addr: libc::sockaddr,
-    }
+    let output = std::process::Command::new("ip")
+        .args(["addr", "add", &format!("{}/{}", addr, prefix_len), "dev", name])
+        .output()?;
 
-    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if sock < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // Helper to set name in ifreq
-    let set_name = |ifr: &mut IfReqAddr, name: &str| {
-        let name_bytes = name.as_bytes();
-        let copy_len = name_bytes.len().min(libc::IFNAMSIZ - 1);
-        for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
-            ifr.ifr_name[i] = b as libc::c_char;
-        }
-    };
-
-    // Set IP address
-    let mut ifr_addr: IfReqAddr = unsafe { std::mem::zeroed() };
-    set_name(&mut ifr_addr, name);
-
-    let sin = &mut ifr_addr.ifr_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
-    unsafe {
-        (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
-        (*sin).sin_addr.s_addr = u32::from_ne_bytes(addr.octets());
-    }
-
-    const SIOCSIFADDR: libc::c_ulong = 0x8916;
-    let ret = unsafe { libc::ioctl(sock, SIOCSIFADDR, &ifr_addr as *const IfReqAddr) };
-    if ret < 0 {
-        unsafe { libc::close(sock) };
-        return Err(io::Error::last_os_error());
-    }
-
-    // Set netmask
-    let mut ifr_mask: IfReqAddr = unsafe { std::mem::zeroed() };
-    set_name(&mut ifr_mask, name);
-
-    let netmask = if prefix_len >= 32 {
-        0xFFFFFFFFu32
-    } else {
-        !((1u32 << (32 - prefix_len)) - 1)
-    };
-
-    let sin = &mut ifr_mask.ifr_addr as *mut libc::sockaddr as *mut libc::sockaddr_in;
-    unsafe {
-        (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
-        (*sin).sin_addr.s_addr = netmask.to_be();
-    }
-
-    const SIOCSIFNETMASK: libc::c_ulong = 0x891c;
-    let ret = unsafe { libc::ioctl(sock, SIOCSIFNETMASK, &ifr_mask as *const IfReqAddr) };
-    unsafe { libc::close(sock) };
-
-    if ret < 0 {
-        return Err(io::Error::last_os_error());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("ip addr add failed: {}", stderr.trim()),
+        ));
     }
 
     Ok(())

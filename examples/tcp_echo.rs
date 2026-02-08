@@ -20,7 +20,7 @@
 
 use log::{debug, info};
 use std::env;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use tap_tunnel::{TapConfig, Tunnel};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -48,8 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // - smoltcp stack (local) gets 10.0.0.2/24 (client side)
     let config = TapConfig::new()
         .interface_name("tap0")
-        .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24)
-        .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24);
+        .peer_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 24)
+        .local_addr(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 24);
 
     let tunnel = Tunnel::connect_with_config(pid, config).await?;
     info!("Connected to tunnel");

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Message type byte for control messages.
 pub const MSG_TYPE_CONTROL: u8 = 0x00;
@@ -30,7 +30,7 @@ pub struct ClientHello {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     /// IP address of the TAP interface (gateway for client).
-    pub tap_ip: Ipv4Addr,
+    pub tap_ip: IpAddr,
     /// MAC address of the TAP interface.
     pub tap_mac: [u8; 6],
     /// Subnet prefix length.
@@ -89,24 +89,53 @@ pub fn decode_message(data: &[u8]) -> io::Result<Message> {
 }
 
 /// Compute the default client IP from the TAP IP (tap_ip + 1).
-pub fn default_client_ip(tap_ip: Ipv4Addr) -> Ipv4Addr {
-    let octets = tap_ip.octets();
-    let ip_u32 = u32::from_be_bytes(octets);
-    Ipv4Addr::from(ip_u32 + 1)
+pub fn default_client_ip(tap_ip: IpAddr) -> IpAddr {
+    match tap_ip {
+        IpAddr::V4(v4) => {
+            let ip_u32 = u32::from_be_bytes(v4.octets());
+            IpAddr::V4(Ipv4Addr::from(ip_u32 + 1))
+        }
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            // Increment the last byte (simple +1 for adjacent addresses)
+            for i in (0..16).rev() {
+                let (val, overflow) = octets[i].overflowing_add(1);
+                octets[i] = val;
+                if !overflow {
+                    break;
+                }
+            }
+            IpAddr::V6(Ipv6Addr::from(octets))
+        }
+    }
 }
 
 /// Validate that an IP is in the same subnet as the TAP IP.
-pub fn validate_ip_in_subnet(ip: Ipv4Addr, tap_ip: Ipv4Addr, prefix_len: u8) -> bool {
-    let mask = if prefix_len >= 32 {
-        u32::MAX
-    } else {
-        u32::MAX << (32 - prefix_len)
-    };
-
-    let ip_u32 = u32::from_be_bytes(ip.octets());
-    let tap_u32 = u32::from_be_bytes(tap_ip.octets());
-
-    (ip_u32 & mask) == (tap_u32 & mask)
+pub fn validate_ip_in_subnet(ip: IpAddr, tap_ip: IpAddr, prefix_len: u8) -> bool {
+    match (ip, tap_ip) {
+        (IpAddr::V4(ip), IpAddr::V4(tap)) => {
+            let mask = if prefix_len >= 32 {
+                u32::MAX
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            let ip_u32 = u32::from_be_bytes(ip.octets());
+            let tap_u32 = u32::from_be_bytes(tap.octets());
+            (ip_u32 & mask) == (tap_u32 & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(tap)) => {
+            let ip_bits = u128::from_be_bytes(ip.octets());
+            let tap_bits = u128::from_be_bytes(tap.octets());
+            let mask = if prefix_len >= 128 {
+                u128::MAX
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            (ip_bits & mask) == (tap_bits & mask)
+        }
+        // Different address families are never in the same subnet
+        _ => false,
+    }
 }
 
 impl std::fmt::Display for ProxyConfig {
@@ -167,25 +196,51 @@ mod tests {
     }
 
     #[test]
-    fn test_default_client_ip() {
+    fn test_default_client_ip_v4() {
         assert_eq!(
-            default_client_ip(Ipv4Addr::new(10, 0, 0, 1)),
-            Ipv4Addr::new(10, 0, 0, 2)
+            default_client_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
         );
     }
 
     #[test]
-    fn test_validate_ip_in_subnet() {
-        let tap_ip = Ipv4Addr::new(10, 0, 0, 1);
+    fn test_default_client_ip_v6() {
+        let tap_ip: IpAddr = "fd00::1".parse().unwrap();
+        let client_ip = default_client_ip(tap_ip);
+        assert_eq!(client_ip, "fd00::2".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_validate_ip_in_subnet_v4() {
+        let tap_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         assert!(validate_ip_in_subnet(
-            Ipv4Addr::new(10, 0, 0, 5),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
             tap_ip,
             24
         ));
         assert!(!validate_ip_in_subnet(
-            Ipv4Addr::new(10, 0, 1, 5),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 5)),
             tap_ip,
             24
         ));
+    }
+
+    #[test]
+    fn test_validate_ip_in_subnet_v6() {
+        let tap_ip: IpAddr = "fd00::1".parse().unwrap();
+        assert!(validate_ip_in_subnet("fd00::5".parse().unwrap(), tap_ip, 64));
+        assert!(!validate_ip_in_subnet(
+            "fd01::5".parse().unwrap(),
+            tap_ip,
+            64
+        ));
+    }
+
+    #[test]
+    fn test_validate_ip_mixed_families() {
+        let v4: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let v6: IpAddr = "fd00::1".parse().unwrap();
+        assert!(!validate_ip_in_subnet(v6, v4, 24));
+        assert!(!validate_ip_in_subnet(v4, v6, 64));
     }
 }

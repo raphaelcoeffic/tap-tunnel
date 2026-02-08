@@ -1,13 +1,13 @@
 //! smoltcp network stack running as a tokio task.
 //!
 //! This module provides a TCP/UDP socket API backed by smoltcp, which handles
-//! all protocol processing (Ethernet, ARP, IP, TCP, UDP) in userspace.
+//! all protocol processing (Ethernet, ARP, NDP, IP, TCP, UDP) in userspace.
 
 mod device;
 
 pub use device::ProxyDevice;
 
-use crate::Ipv4WithPrefix;
+use crate::IpWithPrefix;
 use log::{debug, trace, warn};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::Device;
@@ -17,7 +17,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 use std::collections::HashMap;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
 use std::sync::atomic;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
@@ -162,7 +162,7 @@ pub enum StackCommand {
     /// Returns (handle, local_addr, peer_addr, channels) on success.
     TcpConnect {
         /// Optional local IP to bind the socket to. If None, uses the default (config.ip).
-        local_ip: Option<Ipv4Addr>,
+        local_ip: Option<IpAddr>,
         addr: SocketAddr,
         response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
@@ -192,18 +192,18 @@ pub enum StackCommand {
     UdpClose { handle: SocketHandle },
     /// Add an IP address to the smoltcp interface.
     AddIp {
-        ip: Ipv4Addr,
+        ip: IpAddr,
         prefix_len: u8,
         response: oneshot::Sender<io::Result<()>>,
     },
     /// Remove an IP address from the smoltcp interface.
     RemoveIp {
-        ip: Ipv4Addr,
+        ip: IpAddr,
         response: oneshot::Sender<io::Result<()>>,
     },
     /// Get all IP addresses on the smoltcp interface.
     GetIps {
-        response: oneshot::Sender<Vec<Ipv4WithPrefix>>,
+        response: oneshot::Sender<Vec<IpWithPrefix>>,
     },
 }
 
@@ -231,9 +231,9 @@ struct ListenerState {
 /// Configuration for the network stack.
 pub struct StackConfig {
     pub mac: [u8; 6],
-    pub ip: Ipv4Addr,
+    pub ip: IpAddr,
     pub prefix_len: u8,
-    pub gateway: Ipv4Addr,
+    pub gateway: IpAddr,
 }
 
 /// Run the smoltcp stack as an async task.
@@ -241,7 +241,7 @@ pub struct StackConfig {
 /// This function runs the smoltcp poll loop, processing:
 /// - Incoming frames from the proxy (via device)
 /// - Socket commands from async handles
-/// - Protocol state machines (TCP, ARP, etc.)
+/// - Protocol state machines (TCP, ARP, NDP, etc.)
 pub async fn run_stack(
     device: &mut impl Device,
     config: StackConfig,
@@ -257,16 +257,26 @@ pub async fn run_stack(
     let mut iface = Interface::new(iface_config, device, instant_since(start_timestamp));
 
     // Configure IP address
-    let ip_cidr = IpCidr::new(IpAddress::Ipv4(config.ip), config.prefix_len);
+    let ip_cidr = IpCidr::new(ip_addr_to_smoltcp(config.ip), config.prefix_len);
     iface.update_ip_addrs(|addrs| {
         addrs.push(ip_cidr).expect("failed to add IP address");
     });
 
-    // Configure gateway if provided
-    iface
-        .routes_mut()
-        .add_default_ipv4_route(config.gateway.octets().into())
-        .expect("failed to add default route");
+    // Configure default route based on address family
+    match config.gateway {
+        IpAddr::V4(v4) => {
+            iface
+                .routes_mut()
+                .add_default_ipv4_route(v4.octets().into())
+                .expect("failed to add default IPv4 route");
+        }
+        IpAddr::V6(v6) => {
+            iface
+                .routes_mut()
+                .add_default_ipv6_route(v6.octets().into())
+                .expect("failed to add default IPv6 route");
+        }
+    }
 
     // Enable Any-IP
     iface.set_any_ip(true);
@@ -458,7 +468,7 @@ fn handle_command(
 }
 
 fn handle_tcp_connect(
-    local_ip: Option<Ipv4Addr>,
+    local_ip: Option<IpAddr>,
     addr: SocketAddr,
     iface: &mut Interface,
     sockets: &mut SocketSet<'_>,
@@ -487,7 +497,7 @@ fn handle_tcp_connect(
     // Use ephemeral local port
     let local_port = allocate_ephemeral_port();
     let local = IpListenEndpoint {
-        addr: Some(IpAddress::Ipv4(source_ip)),
+        addr: Some(ip_addr_to_smoltcp(source_ip)),
         port: local_port,
     };
 
@@ -509,7 +519,7 @@ fn handle_tcp_connect(
     tcp_states.insert(handle, state);
 
     // Construct local and peer addresses for later
-    let local_addr = SocketAddr::V4(SocketAddrV4::new(source_ip, local_port));
+    let local_addr = make_socket_addr(source_ip, local_port);
     let peer_addr = addr;
 
     // Store pending connect with address info and channels
@@ -533,24 +543,7 @@ fn handle_tcp_listen(
 ) {
     debug!("tcp_listen on {} with backlog {}", addr, backlog);
 
-    // Validate address
-    let listen_endpoint = match addr {
-        SocketAddr::V4(v4) => IpListenEndpoint {
-            addr: if v4.ip().is_unspecified() {
-                None
-            } else {
-                Some(IpAddress::Ipv4(*v4.ip()))
-            },
-            port: v4.port(),
-        },
-        SocketAddr::V6(_) => {
-            let _ = response.send(Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "IPv6 not supported",
-            )));
-            return;
-        }
-    };
+    let listen_endpoint = socket_addr_to_listen_endpoint(addr);
 
     // Check for port 0 (not supported for listen)
     if addr.port() == 0 {
@@ -701,20 +694,7 @@ fn try_accept_socket(
     );
 
     // Create a replacement listening socket to maintain backlog
-    let listen_endpoint = match state.addr {
-        SocketAddr::V4(v4) => IpListenEndpoint {
-            addr: if v4.ip().is_unspecified() {
-                None
-            } else {
-                Some(IpAddress::Ipv4(*v4.ip()))
-            },
-            port: v4.port(),
-        },
-        SocketAddr::V6(_) => {
-            // Shouldn't happen, but handle gracefully
-            return Some((accepted_handle, local, peer));
-        }
-    };
+    let listen_endpoint = socket_addr_to_listen_endpoint(state.addr);
 
     let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_SIZE]);
     let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_SIZE]);
@@ -799,28 +779,10 @@ fn handle_udp_bind(
     // Construct the actual bound address (with allocated port if ephemeral)
     let bound_addr = match addr {
         SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)),
-        SocketAddr::V6(_) => {
-            let _ = response.send(Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "IPv6 not supported",
-            )));
-            return;
-        }
+        SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(*v6.ip(), port, 0, 0)),
     };
 
-    let endpoint = IpListenEndpoint {
-        addr: match addr {
-            SocketAddr::V4(v4) => {
-                if v4.ip().is_unspecified() {
-                    None
-                } else {
-                    Some(IpAddress::Ipv4(*v4.ip()))
-                }
-            }
-            SocketAddr::V6(_) => unreachable!(), // Already handled above
-        },
-        port,
-    };
+    let endpoint = socket_addr_to_listen_endpoint_with_port(addr, port);
 
     trace!("udp_bind: endpoint={:?}", endpoint);
 
@@ -855,13 +817,13 @@ fn handle_udp_close(
 }
 
 fn handle_add_ip(
-    ip: Ipv4Addr,
+    ip: IpAddr,
     prefix_len: u8,
     iface: &mut Interface,
     response: oneshot::Sender<io::Result<()>>,
 ) {
     debug!("add_ip: {}/{}", ip, prefix_len);
-    let cidr = IpCidr::new(IpAddress::Ipv4(ip), prefix_len);
+    let cidr = IpCidr::new(ip_addr_to_smoltcp(ip), prefix_len);
 
     // Check if already present
     let already_present = iface.ip_addrs().iter().any(|a| a == &cidr);
@@ -885,31 +847,27 @@ fn handle_add_ip(
 }
 
 fn handle_remove_ip(
-    ip: Ipv4Addr,
+    ip: IpAddr,
     iface: &mut Interface,
     response: oneshot::Sender<io::Result<()>>,
 ) {
     debug!("remove_ip: {}", ip);
-    let target = smoltcp::wire::Ipv4Address::from(ip.octets());
+    let target = ip_addr_to_smoltcp(ip);
 
     iface.update_ip_addrs(|addrs| {
-        addrs.retain(|a| match a {
-            IpCidr::Ipv4(cidr) => cidr.address() != target,
-        });
+        addrs.retain(|a| a.address() != target);
     });
 
     let _ = response.send(Ok(()));
 }
 
-fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<Ipv4WithPrefix>>) {
+fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<IpWithPrefix>>) {
     let ips: Vec<_> = iface
         .ip_addrs()
         .iter()
-        .map(|cidr| match cidr {
-            IpCidr::Ipv4(c) => {
-                let octets = c.address().octets();
-                (Ipv4Addr::from(octets), c.prefix_len())
-            }
+        .map(|cidr| {
+            let ip = smoltcp_to_ip_addr(cidr.address());
+            (ip, cidr.prefix_len())
         })
         .collect();
 
@@ -1144,22 +1102,63 @@ fn instant_since(start: StdInstant) -> Instant {
     Instant::from_micros((StdInstant::now() - start).as_micros() as i64)
 }
 
-fn socket_addr_to_endpoint(addr: SocketAddr) -> IpEndpoint {
+/// Convert a std IpAddr to a smoltcp IpAddress.
+fn ip_addr_to_smoltcp(addr: IpAddr) -> IpAddress {
     match addr {
-        SocketAddr::V4(v4) => IpEndpoint::new(IpAddress::Ipv4(*v4.ip()), v4.port()),
-        SocketAddr::V6(_) => panic!("IPv6 not supported"),
+        IpAddr::V4(v4) => IpAddress::Ipv4(v4.octets().into()),
+        IpAddr::V6(v6) => IpAddress::Ipv6(v6.octets().into()),
     }
 }
 
+/// Convert a smoltcp IpAddress to a std IpAddr.
+fn smoltcp_to_ip_addr(addr: IpAddress) -> IpAddr {
+    match addr {
+        IpAddress::Ipv4(v4) => IpAddr::V4(Ipv4Addr::from(v4.octets())),
+        IpAddress::Ipv6(v6) => IpAddr::V6(Ipv6Addr::from(v6.octets())),
+    }
+}
+
+/// Convert a SocketAddr to a smoltcp IpEndpoint.
+fn socket_addr_to_endpoint(addr: SocketAddr) -> IpEndpoint {
+    IpEndpoint::new(ip_addr_to_smoltcp(addr.ip()), addr.port())
+}
+
+/// Convert a smoltcp IpEndpoint to a SocketAddr.
 fn endpoint_to_socket_addr(endpoint: IpEndpoint) -> SocketAddr {
-    match endpoint.addr {
-        IpAddress::Ipv4(v4) => {
-            let octets = v4.octets();
-            SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]),
-                endpoint.port,
-            ))
-        }
+    make_socket_addr(smoltcp_to_ip_addr(endpoint.addr), endpoint.port)
+}
+
+/// Convert a SocketAddr to a smoltcp IpListenEndpoint.
+fn socket_addr_to_listen_endpoint(addr: SocketAddr) -> IpListenEndpoint {
+    let smoltcp_addr = ip_addr_to_smoltcp(addr.ip());
+    IpListenEndpoint {
+        addr: if addr.ip().is_unspecified() {
+            None
+        } else {
+            Some(smoltcp_addr)
+        },
+        port: addr.port(),
+    }
+}
+
+/// Convert a SocketAddr to a smoltcp IpListenEndpoint with a specific port.
+fn socket_addr_to_listen_endpoint_with_port(addr: SocketAddr, port: u16) -> IpListenEndpoint {
+    let smoltcp_addr = ip_addr_to_smoltcp(addr.ip());
+    IpListenEndpoint {
+        addr: if addr.ip().is_unspecified() {
+            None
+        } else {
+            Some(smoltcp_addr)
+        },
+        port,
+    }
+}
+
+/// Create a SocketAddr from an IpAddr and port.
+fn make_socket_addr(ip: IpAddr, port: u16) -> SocketAddr {
+    match ip {
+        IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, port)),
+        IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, 0)),
     }
 }
 

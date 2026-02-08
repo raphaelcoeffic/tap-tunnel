@@ -36,15 +36,15 @@
 //!
 //! ```no_run
 //! use tap_tunnel::{TapConfig, Tunnel};
-//! use std::net::Ipv4Addr;
+//! use std::net::IpAddr;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Connect to the network namespace of PID 1234
 //! // - peer_addr: IP for the TAP interface in the namespace (server side)
 //! // - local_addr: IP for the smoltcp stack (client side)
 //! let config = TapConfig::new()
-//!     .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24)
-//!     .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24);
+//!     .peer_addr("10.0.0.1".parse().unwrap(), 24)
+//!     .local_addr("10.0.0.2".parse().unwrap(), 24);
 //! let tunnel = Tunnel::connect_with_config(1234, config).await?;
 //!
 //! // Create a TCP connection to a server in the namespace
@@ -67,7 +67,7 @@ use smoltcp::phy::FaultInjector;
 use socket::{TcpListener, TcpStream, UdpSocket};
 use stack::{ProxyDevice, StackCommand, StackConfig};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -109,8 +109,8 @@ const DEFAULT_TCP_BACKLOG: usize = 8;
 /// Channel sender for stack commands.
 pub(crate) type CommandSender = Sender<StackCommand>;
 
-/// IPv4 address with prefix length (e.g., 10.0.0.1/24).
-pub type Ipv4WithPrefix = (Ipv4Addr, u8);
+/// IP address with prefix length (e.g., 10.0.0.1/24 or fd00::1/64).
+pub type IpWithPrefix = (IpAddr, u8);
 
 /// Configuration for the TAP tunnel.
 ///
@@ -127,10 +127,10 @@ pub type Ipv4WithPrefix = (Ipv4Addr, u8);
 pub struct TapConfig {
     /// Name of the TAP interface (default: "tap0")
     pub interface_name: String,
-    /// IPv4 address for the TAP interface in the namespace (peer side)
-    pub peer_addr: Option<Ipv4WithPrefix>,
-    /// IPv4 address for the smoltcp stack (local/client side)
-    pub local_addr: Option<Ipv4WithPrefix>,
+    /// IP address for the TAP interface in the namespace (peer side)
+    pub peer_addr: Option<IpWithPrefix>,
+    /// IP address for the smoltcp stack (local/client side)
+    pub local_addr: Option<IpWithPrefix>,
     /// MAC address for the smoltcp stack (default: auto-generated)
     pub mac: Option<[u8; 6]>,
     /// Packet loss percentage for testing (0-100, default: 0)
@@ -161,16 +161,16 @@ impl TapConfig {
         self
     }
 
-    /// Set the IPv4 address for the TAP interface in the namespace.
+    /// Set the IP address for the TAP interface in the namespace.
     /// This is the address that servers in the namespace should listen on.
-    pub fn peer_addr(mut self, addr: Ipv4Addr, prefix_len: u8) -> Self {
+    pub fn peer_addr(mut self, addr: IpAddr, prefix_len: u8) -> Self {
         self.peer_addr = Some((addr, prefix_len));
         self
     }
 
-    /// Set the IPv4 address for the smoltcp stack (client side).
+    /// Set the IP address for the smoltcp stack (client side).
     /// This is the source address used when connecting to servers.
-    pub fn local_addr(mut self, addr: Ipv4Addr, prefix_len: u8) -> Self {
+    pub fn local_addr(mut self, addr: IpAddr, prefix_len: u8) -> Self {
         self.local_addr = Some((addr, prefix_len));
         self
     }
@@ -206,9 +206,9 @@ struct TunnelInner {
     /// TAP proxy child process (None when using socket-path mode)
     proxy_child: Mutex<Option<Child>>,
     /// Gateway info from proxy: (tap_ip, tap_mac)
-    gateway: (Ipv4Addr, [u8; 6]),
+    gateway: (IpAddr, [u8; 6]),
     /// Local IP (first IP added to the interface)
-    local_addr: Ipv4WithPrefix,
+    local_addr: IpWithPrefix,
 }
 
 impl Drop for TunnelInner {
@@ -445,20 +445,23 @@ impl Tunnel {
     ///
     /// ```no_run
     /// use tap_tunnel::Tunnel;
-    /// use std::net::Ipv4Addr;
+    /// use std::net::IpAddr;
     ///
     /// # async fn example() -> std::io::Result<()> {
     /// // Use default IP (tap_ip + 1)
     /// let tunnel = Tunnel::connect_to("/tmp/tunnel.sock", None).await?;
     ///
     /// // Use specific IP
-    /// let tunnel = Tunnel::connect_to("/tmp/tunnel.sock", Some(Ipv4Addr::new(10, 0, 0, 5))).await?;
+    /// let tunnel = Tunnel::connect_to(
+    ///     "/tmp/tunnel.sock",
+    ///     Some("10.0.0.5".parse().unwrap()),
+    /// ).await?;
     /// # Ok(())
     /// # }
     /// ```
     pub async fn connect_to(
         socket_path: impl AsRef<Path>,
-        local_ip: Option<Ipv4Addr>,
+        local_ip: Option<IpAddr>,
     ) -> io::Result<Self> {
         Self::connect_to_blocking(socket_path, local_ip)
     }
@@ -466,7 +469,7 @@ impl Tunnel {
     /// Synchronous version of `connect_to`.
     pub fn connect_to_blocking(
         socket_path: impl AsRef<Path>,
-        local_ip: Option<Ipv4Addr>,
+        local_ip: Option<IpAddr>,
     ) -> io::Result<Self> {
         use protocol::{
             ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
@@ -527,7 +530,7 @@ impl Tunnel {
         frame_stream: UnixStream,
         config: TapConfig,
         proxy_child: Option<Child>,
-        gateway: (Ipv4Addr, [u8; 6]),
+        gateway: (IpAddr, [u8; 6]),
     ) -> io::Result<Self> {
         // Set up channels for stack communication
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
@@ -660,27 +663,6 @@ impl Tunnel {
     ///
     /// The listener will accept incoming connections from the network namespace.
     /// Use `accept()` to accept connections.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use tap_tunnel::{TapConfig, Tunnel};
-    /// use std::net::Ipv4Addr;
-    ///
-    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let config = TapConfig::new()
-    ///     .peer_addr(Ipv4Addr::new(10, 0, 0, 1), 24)
-    ///     .local_addr(Ipv4Addr::new(10, 0, 0, 2), 24);
-    /// let tunnel = Tunnel::connect_with_config(1234, config).await?;
-    ///
-    /// // Listen on the smoltcp stack's address
-    /// let listener = tunnel.tcp_listen("10.0.0.2:8080".parse()?).await?;
-    ///
-    /// // Accept connections from the namespace
-    /// let (stream, peer_addr) = listener.accept().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn tcp_listen(&self, addr: SocketAddr) -> io::Result<TcpListener> {
         self.tcp_listen_with_backlog(addr, DEFAULT_TCP_BACKLOG)
             .await
@@ -743,7 +725,7 @@ impl Tunnel {
     /// and want to bind to a specific one for the outgoing connection.
     pub async fn tcp_connect_from(
         &self,
-        local_ip: Ipv4Addr,
+        local_ip: IpAddr,
         remote_addr: SocketAddr,
     ) -> io::Result<TcpStream> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -774,7 +756,7 @@ impl Tunnel {
     ///
     /// This allows the tunnel to send/receive traffic using this IP.
     /// The prefix length determines the subnet mask for routing.
-    pub async fn add_local_ip(&self, ip: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
+    pub async fn add_local_ip(&self, ip: IpAddr, prefix_len: u8) -> io::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.inner
@@ -791,7 +773,7 @@ impl Tunnel {
     }
 
     /// Remove a local IP address from the smoltcp interface.
-    pub async fn remove_local_ip(&self, ip: Ipv4Addr) -> io::Result<()> {
+    pub async fn remove_local_ip(&self, ip: IpAddr) -> io::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.inner
@@ -806,7 +788,7 @@ impl Tunnel {
     /// Get current local IP addresses on the smoltcp interface.
     ///
     /// Returns a list of (IP, prefix_len) pairs.
-    pub async fn local_ips(&self) -> io::Result<Vec<Ipv4WithPrefix>> {
+    pub async fn local_ips(&self) -> io::Result<Vec<IpWithPrefix>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.inner
@@ -819,12 +801,12 @@ impl Tunnel {
     }
 
     /// Local IP (first IP added to the interface)
-    pub fn local_addr(&self) -> Ipv4WithPrefix {
+    pub fn local_addr(&self) -> IpWithPrefix {
         self.inner.local_addr
     }
 
     /// Get the proxy's gateway info (TAP IP and MAC address).
-    pub fn gateway(&self) -> (Ipv4Addr, [u8; 6]) {
+    pub fn gateway(&self) -> (IpAddr, [u8; 6]) {
         self.inner.gateway
     }
 }

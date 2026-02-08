@@ -119,6 +119,13 @@ impl ProxyProcess {
     }
 }
 
+impl ProxyProcess {
+    /// Kill the proxy process immediately.
+    pub fn kill(&mut self) {
+        kill_process_tree(&mut self.child);
+    }
+}
+
 impl Drop for ProxyProcess {
     fn drop(&mut self) {
         kill_process_tree(&mut self.child);

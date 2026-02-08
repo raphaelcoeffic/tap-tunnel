@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use std::sync::atomic;
+use std::sync::atomic::{self, AtomicBool};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, Receiver};
@@ -246,6 +246,7 @@ pub async fn run_stack(
     device: &mut impl Device,
     config: StackConfig,
     mut commands: Receiver<StackCommand>,
+    ipc_dead: Arc<AtomicBool>,
 ) {
     debug!("run_stack starting");
 
@@ -385,6 +386,29 @@ pub async fn run_stack(
                 &mut tcp_states,
                 &write_notify,
             );
+        }
+
+        // Check if IPC connection to proxy was lost
+        if ipc_dead.load(atomic::Ordering::Relaxed) {
+            warn!("IPC connection lost, shutting down stack");
+            // Fail all pending operations
+            for (_handle, op) in pending.drain() {
+                match op {
+                    PendingOp::TcpConnect { response, .. } => {
+                        let _ = response.send(Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "proxy connection lost",
+                        )));
+                    }
+                    PendingOp::TcpAccept { response } => {
+                        let _ = response.send(Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "proxy connection lost",
+                        )));
+                    }
+                }
+            }
+            return;
         }
     }
 }

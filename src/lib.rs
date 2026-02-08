@@ -71,7 +71,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
 
@@ -325,6 +326,7 @@ fn spawn_proxy(pid: u32, frame_fd: OwnedFd, config: &TapConfig) -> io::Result<Ch
     let frame_fd_num = frame_fd.as_raw_fd();
 
     let mut cmd = Command::new(&proxy_path);
+    cmd.stderr(Stdio::piped());
     cmd.arg("--pid").arg(pid.to_string());
     cmd.arg("--frame-fd").arg(frame_fd_num.to_string());
     cmd.arg("--tap-name").arg(&config.interface_name);
@@ -358,6 +360,21 @@ fn fd_to_unix_stream(fd: OwnedFd) -> io::Result<UnixStream> {
     Ok(stream)
 }
 
+/// Read stderr from a child process (best-effort, for error reporting).
+fn read_child_stderr(child: &mut Child) -> String {
+    use std::io::Read;
+    child
+        .stderr
+        .take()
+        .and_then(|mut stderr| {
+            let mut s = String::new();
+            stderr.read_to_string(&mut s).ok().map(|_| s)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 impl Tunnel {
     /// Connect to the network namespace of the given PID with default configuration.
     pub async fn connect(pid: u32) -> io::Result<Self> {
@@ -383,7 +400,7 @@ impl Tunnel {
         let (parent_fd, child_fd) = ipc::create_socketpair()?;
 
         // Spawn the proxy process
-        let proxy_child = spawn_proxy(pid, child_fd, &config)?;
+        let mut proxy_child = spawn_proxy(pid, child_fd, &config)?;
 
         // Convert to UnixStream for handshake
         let mut stream = fd_to_unix_stream(parent_fd)?;
@@ -394,12 +411,47 @@ impl Tunnel {
         stream.write_all(&hello_msg)?;
         debug!("sent ClientHello: {:?}", hello);
 
-        // Receive ProxyConfig (contains proxy identity: tap_ip, tap_mac, prefix_len)
+        // Receive ProxyConfig with timeout and child-exit monitoring
         let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Err(unexpected_eof("proxy closed connection during handshake"));
-        }
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let n = loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    let stderr = read_child_stderr(&mut proxy_child);
+                    let msg = if stderr.is_empty() {
+                        "proxy closed connection during handshake".to_string()
+                    } else {
+                        format!("proxy closed connection during handshake: {}", stderr)
+                    };
+                    return Err(unexpected_eof(&msg));
+                }
+                Ok(n) => break n,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    if std::time::Instant::now() > deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out waiting for proxy handshake",
+                        ));
+                    }
+                    if let Some(status) = proxy_child.try_wait()? {
+                        let stderr = read_child_stderr(&mut proxy_child);
+                        let msg = if stderr.is_empty() {
+                            format!("proxy exited with {status}")
+                        } else {
+                            format!("proxy exited with {status}: {stderr}")
+                        };
+                        return Err(io::Error::new(io::ErrorKind::Other, msg));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        // Restore blocking mode for IPC after handshake
+        stream.set_read_timeout(None)?;
 
         let msg = decode_message(&buf[..n])?;
         let proxy_config: ProxyConfig = match msg {
@@ -492,12 +544,14 @@ impl Tunnel {
         stream.write_all(&hello_msg)?;
         debug!("sent ClientHello: {:?}", hello);
 
-        // Receive ProxyConfig (contains proxy identity: tap_ip, tap_mac, prefix_len)
+        // Receive ProxyConfig with timeout
         let mut buf = [0u8; 1024];
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
         let n = stream.read(&mut buf)?;
         if n == 0 {
             return Err(unexpected_eof("proxy closed connection during handshake"));
         }
+        stream.set_read_timeout(None)?;
 
         let msg = decode_message(&buf[..n])?;
         let proxy_config: ProxyConfig = match msg {
@@ -572,6 +626,11 @@ impl Tunnel {
         let mut ipc_read_stream = tokio::net::UnixStream::from_std(frame_read_stream)?;
         let mut ipc_write_stream = tokio::net::UnixStream::from_std(frame_write_stream)?;
 
+        // Shared flag: set by IPC tasks when proxy connection is lost
+        let ipc_dead = Arc::new(AtomicBool::new(false));
+        let ipc_dead_reader = Arc::clone(&ipc_dead);
+        let ipc_dead_writer = Arc::clone(&ipc_dead);
+
         // Spawn IPC reader task (proxy -> stack)
         tokio::spawn(async move {
             use protocol::{Message, decode_message};
@@ -579,20 +638,28 @@ impl Tunnel {
 
             debug!("[IPC-RX] reader task starting");
             let mut buf = [0u8; IPC_READ_BUFFER_SIZE];
-            while let Ok(n) = ipc_read_stream.read(&mut buf).await {
-                if n == 0 {
-                    debug!("[IPC-RX] proxy closed connection");
-                    break;
-                }
-
-                match decode_message(&buf[..n]) {
-                    Ok(Message::Frame(frame)) => {
-                        if frame_tx.send(frame).await.is_err() {
-                            break;
-                        }
+            loop {
+                match ipc_read_stream.read(&mut buf).await {
+                    Ok(0) => {
+                        debug!("[IPC-RX] proxy closed connection");
+                        ipc_dead_reader.store(true, Ordering::Relaxed);
+                        break;
                     }
-                    Ok(Message::Control(_)) => {} // Ignore post-handshake control
-                    Err(_) => {}                  // Ignore decode errors
+                    Ok(n) => match decode_message(&buf[..n]) {
+                        Ok(Message::Frame(frame)) => {
+                            if frame_tx.send(frame).await.is_err() {
+                                // Stack dropped first - clean shutdown, don't set ipc_dead
+                                break;
+                            }
+                        }
+                        Ok(Message::Control(_)) => {} // Ignore post-handshake control
+                        Err(_) => {}                  // Ignore decode errors
+                    },
+                    Err(e) => {
+                        debug!("[IPC-RX] read error: {}", e);
+                        ipc_dead_reader.store(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
             }
         });
@@ -606,9 +673,12 @@ impl Tunnel {
             while let Some(frame) = frame_to_proxy_rx.recv().await {
                 let msg = encode_frame(&frame);
                 if ipc_write_stream.write_all(&msg).await.is_err() {
+                    debug!("[IPC-TX] write error, proxy connection lost");
+                    ipc_dead_writer.store(true, Ordering::Relaxed);
                     break;
                 }
             }
+            // recv() returning None = clean shutdown (stack dropped), don't set ipc_dead
         });
 
         // Create device for smoltcp
@@ -616,9 +686,9 @@ impl Tunnel {
         let mut device = FaultInjector::new(device, random_seed());
         device.set_drop_chance(config.packet_loss_percent);
 
-        // Spawn stack task (will exit when command channel disconnects)
+        // Spawn stack task (will exit when command channel disconnects or IPC dies)
         tokio::spawn(async move {
-            stack::run_stack(&mut device, stack_config, cmd_rx).await;
+            stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead).await;
         });
 
         Ok(Tunnel {

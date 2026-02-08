@@ -97,22 +97,112 @@ pub fn get_interface_mac(name: &str) -> io::Result<[u8; 6]> {
 
 /// Configure an IP address (IPv4 or IPv6) on a network interface.
 ///
-/// Uses `ip addr add` command which handles both address families.
+/// Uses netlink RTM_NEWADDR to add the address directly, avoiding
+/// a dependency on iproute2 (`ip` command).
 pub fn configure_interface_ip(
     name: &str,
     addr: std::net::IpAddr,
     prefix_len: u8,
 ) -> io::Result<()> {
-    let output = std::process::Command::new("ip")
-        .args(["addr", "add", &format!("{}/{}", addr, prefix_len), "dev", name])
-        .output()?;
+    // Netlink constants (not all available in libc crate)
+    const RTM_NEWADDR: u16 = 20;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_ACK: u16 = 4;
+    const NLM_F_CREATE: u16 = 0x400;
+    const NLM_F_EXCL: u16 = 0x200;
+    const IFA_LOCAL: u16 = 2;
+    const IFA_ADDRESS: u16 = 1;
+    const NLMSG_ERROR: u16 = 2;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // Get interface index
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
+    let ifindex = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+    if ifindex == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Determine address family and bytes
+    let (family, addr_bytes): (u8, Vec<u8>) = match addr {
+        std::net::IpAddr::V4(v4) => (libc::AF_INET as u8, v4.octets().to_vec()),
+        std::net::IpAddr::V6(v6) => (libc::AF_INET6 as u8, v6.octets().to_vec()),
+    };
+
+    // rtattr: 4-byte header (2 len + 2 type) + payload, padded to 4 bytes
+    let rta_len = 4u16 + addr_bytes.len() as u16;
+    let rta_padded = ((rta_len as usize) + 3) & !3;
+
+    // nlmsghdr (16) + ifaddrmsg (8) + 2 rtattrs
+    let msg_len: u32 = 16 + 8 + (2 * rta_padded) as u32;
+
+    let mut buf = vec![0u8; msg_len as usize];
+
+    // nlmsghdr (16 bytes)
+    let nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
+    buf[0..4].copy_from_slice(&msg_len.to_ne_bytes());
+    buf[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+    buf[6..8].copy_from_slice(&nlmsg_flags.to_ne_bytes());
+    buf[8..12].copy_from_slice(&1u32.to_ne_bytes()); // seq
+    buf[12..16].copy_from_slice(&0u32.to_ne_bytes()); // pid
+
+    // ifaddrmsg (8 bytes) at offset 16
+    buf[16] = family; // ifa_family
+    buf[17] = prefix_len; // ifa_prefixlen
+    buf[18] = 0; // ifa_flags
+    buf[19] = 0; // ifa_scope (RT_SCOPE_UNIVERSE)
+    buf[20..24].copy_from_slice(&ifindex.to_ne_bytes()); // ifa_index
+
+    // First rtattr: IFA_ADDRESS at offset 24
+    let off = 24;
+    buf[off..off + 2].copy_from_slice(&rta_len.to_ne_bytes());
+    buf[off + 2..off + 4].copy_from_slice(&IFA_ADDRESS.to_ne_bytes());
+    buf[off + 4..off + 4 + addr_bytes.len()].copy_from_slice(&addr_bytes);
+
+    // Second rtattr: IFA_LOCAL
+    let off = 24 + rta_padded;
+    buf[off..off + 2].copy_from_slice(&rta_len.to_ne_bytes());
+    buf[off + 2..off + 4].copy_from_slice(&IFA_LOCAL.to_ne_bytes());
+    buf[off + 4..off + 4 + addr_bytes.len()].copy_from_slice(&addr_bytes);
+
+    // Open netlink socket
+    let sock = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, libc::NETLINK_ROUTE) };
+    if sock < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Send the message
+    let sent = unsafe { libc::send(sock, buf.as_ptr() as *const _, buf.len(), 0) };
+    if sent < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(sock) };
+        return Err(err);
+    }
+
+    // Read ACK response
+    let mut resp = [0u8; 1024];
+    let n = unsafe { libc::recv(sock, resp.as_mut_ptr() as *mut _, resp.len(), 0) };
+    unsafe { libc::close(sock) };
+
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Parse response: nlmsghdr (16 bytes) + nlmsgerr (4 bytes error + 16 bytes orig header)
+    let n = n as usize;
+    if n < 20 {
         return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("ip addr add failed: {}", stderr.trim()),
+            io::ErrorKind::InvalidData,
+            "netlink response too short",
         ));
+    }
+
+    let resp_type = u16::from_ne_bytes([resp[4], resp[5]]);
+    if resp_type == NLMSG_ERROR {
+        let error = i32::from_ne_bytes([resp[16], resp[17], resp[18], resp[19]]);
+        if error < 0 {
+            return Err(io::Error::from_raw_os_error(-error));
+        }
+        // error == 0 means ACK (success)
     }
 
     Ok(())

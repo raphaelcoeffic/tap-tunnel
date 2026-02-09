@@ -31,7 +31,7 @@ mod tap;
 
 use ipc::{accept_seqpacket, create_seqpacket_listener};
 use namespace::join_namespace;
-use tap::{bring_interface_up, configure_interface_ip, create_tap, get_interface_mac};
+use tap::{configure_interface, create_tap};
 use tap_tunnel::TapConfig;
 use tap_tunnel::protocol::{
     ClientHello, Message, ProxyConfig, decode_control, decode_message, encode_control, encode_frame,
@@ -159,18 +159,12 @@ fn run(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
     let tap_fd = create_tap(&config.interface_name)?;
     debug!("created TAP interface: {}", config.interface_name);
 
-    // Configure IP address if specified (peer_addr is the TAP interface address)
+    // Configure IP (if specified), bring up, and get MAC address
+    let tap_mac = configure_interface(&config.interface_name, config.peer_addr)?;
     if let Some((ip, prefix_len)) = config.peer_addr {
-        configure_interface_ip(&config.interface_name, ip, prefix_len)?;
         debug!("configured IP: {}/{}", ip, prefix_len);
     }
-
-    // Bring the interface up
-    bring_interface_up(&config.interface_name)?;
     debug!("interface {} is up", config.interface_name);
-
-    // Get TAP interface MAC address
-    let tap_mac = get_interface_mac(&config.interface_name)?;
     debug!(
         "TAP MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         tap_mac[0], tap_mac[1], tap_mac[2], tap_mac[3], tap_mac[4], tap_mac[5]

@@ -12,7 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 
 /// A TCP stream connected to a remote endpoint.
 ///

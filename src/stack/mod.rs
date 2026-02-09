@@ -415,6 +415,7 @@ pub async fn run_stack(
 
 /// Handle a command from an async socket handle.
 /// Returns false if the stack should shut down.
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     cmd: StackCommand,
     iface: &mut Interface,
@@ -491,6 +492,7 @@ fn handle_command(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_tcp_connect(
     local_ip: Option<IpAddr>,
     addr: SocketAddr,
@@ -870,11 +872,7 @@ fn handle_add_ip(
     let _ = response.send(add_result);
 }
 
-fn handle_remove_ip(
-    ip: IpAddr,
-    iface: &mut Interface,
-    response: oneshot::Sender<io::Result<()>>,
-) {
+fn handle_remove_ip(ip: IpAddr, iface: &mut Interface, response: oneshot::Sender<io::Result<()>>) {
     debug!("remove_ip: {}", ip);
     let target = ip_addr_to_smoltcp(ip);
 

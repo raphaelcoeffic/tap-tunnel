@@ -228,7 +228,11 @@ mod tests {
     #[test]
     fn test_validate_ip_in_subnet_v6() {
         let tap_ip: IpAddr = "fd00::1".parse().unwrap();
-        assert!(validate_ip_in_subnet("fd00::5".parse().unwrap(), tap_ip, 64));
+        assert!(validate_ip_in_subnet(
+            "fd00::5".parse().unwrap(),
+            tap_ip,
+            64
+        ));
         assert!(!validate_ip_in_subnet(
             "fd01::5".parse().unwrap(),
             tap_ip,

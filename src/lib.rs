@@ -77,8 +77,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
 
 pub use socket::{
-    OwnedReadHalf, OwnedWriteHalf, TcpListener as TunnelTcpListener,
-    TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket,
+    OwnedReadHalf, OwnedWriteHalf, TcpListener as TunnelTcpListener, TcpStream as TunnelTcpStream,
+    UdpSocket as TunnelUdpSocket,
 };
 
 /// Capacity of the command channel between async API and stack task.
@@ -444,7 +444,7 @@ impl Tunnel {
                         } else {
                             format!("proxy exited with {status}: {stderr}")
                         };
-                        return Err(io::Error::new(io::ErrorKind::Other, msg));
+                        return Err(io::Error::other(msg));
                     }
                 }
                 Err(e) => return Err(e),

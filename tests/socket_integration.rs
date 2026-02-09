@@ -266,7 +266,7 @@ async fn test_udp_send_recv() {
 
     // Bind UDP socket on local address
     let local_bind: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
-    let mut socket = tunnel
+    let socket = tunnel
         .udp_bind(local_bind)
         .await
         .expect("failed to udp_bind");
@@ -298,7 +298,7 @@ async fn test_udp_multiple_messages() {
         .expect("failed to connect to namespace");
 
     let local_bind: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
-    let mut socket = tunnel
+    let socket = tunnel
         .udp_bind(local_bind)
         .await
         .expect("failed to udp_bind");
@@ -1136,11 +1136,7 @@ async fn test_tcp_local_addr_peer_addr() {
 
     // local_addr should be the local IP with an ephemeral port
     let local_addr = stream.local_addr();
-    assert_eq!(
-        local_addr.ip(),
-        LOCAL_IP,
-        "local IP should match"
-    );
+    assert_eq!(local_addr.ip(), LOCAL_IP, "local IP should match");
     assert!(local_addr.port() >= 49152, "local port should be ephemeral");
 
     // peer_addr should match the server address we connected to
@@ -1174,18 +1170,14 @@ async fn test_udp_local_addr_ephemeral() {
 
     // Bind to port 0 to get an ephemeral port
     let bind_addr: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
-    let mut socket = tunnel
+    let socket = tunnel
         .udp_bind(bind_addr)
         .await
         .expect("failed to udp_bind");
 
     // local_addr should have the actual allocated port, not 0
     let local_addr = socket.local_addr();
-    assert_eq!(
-        local_addr.ip(),
-        LOCAL_IP,
-        "local IP should match"
-    );
+    assert_eq!(local_addr.ip(), LOCAL_IP, "local IP should match");
     assert!(
         local_addr.port() >= 49152,
         "local port should be ephemeral, got {}",
@@ -1522,29 +1514,23 @@ async fn test_handshake_timeout_no_response() {
     init_logging();
 
     // Create a SEQPACKET listener that accepts connections but never responds
-    let socket_path = format!(
-        "/tmp/tap-tunnel-test-timeout-{}.sock",
-        std::process::id()
-    );
+    let socket_path = format!("/tmp/tap-tunnel-test-timeout-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
     // Spawn a thread that listens on the socket path but never writes back
     let path_clone = socket_path.clone();
     let listener_handle = std::thread::spawn(move || {
         unsafe {
-            let fd = libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                0,
-            );
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
             assert!(fd >= 0, "socket() failed");
 
             let mut addr: libc::sockaddr_un = std::mem::zeroed();
             addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
             let path_bytes = path_clone.as_bytes();
-            addr.sun_path[..path_bytes.len()].copy_from_slice(
-                std::slice::from_raw_parts(path_bytes.as_ptr() as *const i8, path_bytes.len()),
-            );
+            addr.sun_path[..path_bytes.len()].copy_from_slice(std::slice::from_raw_parts(
+                path_bytes.as_ptr() as *const i8,
+                path_bytes.len(),
+            ));
 
             let ret = libc::bind(
                 fd,
@@ -1587,8 +1573,7 @@ async fn test_handshake_timeout_no_response() {
 
     let err = result.err().expect("should fail with timeout");
     assert!(
-        err.kind() == std::io::ErrorKind::TimedOut
-            || err.kind() == std::io::ErrorKind::WouldBlock,
+        err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock,
         "error kind should be TimedOut or WouldBlock, got: {} ({:?})",
         err,
         err.kind()
@@ -1617,10 +1602,7 @@ async fn test_proxy_exit_during_handshake() {
 
     // Use a fake proxy binary that exits immediately with an error message.
     // We create a small shell script as the "proxy".
-    let fake_proxy = format!(
-        "/tmp/tap-tunnel-test-fake-proxy-{}.sh",
-        std::process::id()
-    );
+    let fake_proxy = format!("/tmp/tap-tunnel-test-fake-proxy-{}.sh", std::process::id());
     std::fs::write(
         &fake_proxy,
         "#!/bin/sh\necho 'fatal: cannot access namespace' >&2\nexit 1\n",
@@ -1656,7 +1638,10 @@ async fn test_proxy_exit_during_handshake() {
     }
     let _ = std::fs::remove_file(&fake_proxy);
 
-    let err_msg = result.err().expect("should fail when proxy exits").to_string();
+    let err_msg = result
+        .err()
+        .expect("should fail when proxy exits")
+        .to_string();
     assert!(
         err_msg.contains("proxy") || err_msg.contains("cannot access namespace"),
         "error should mention proxy failure or stderr, got: {}",
@@ -1670,10 +1655,7 @@ async fn test_proxy_exit_during_handshake() {
 async fn test_proxy_crash_fails_pending_tcp_connect() {
     init_logging();
 
-    let socket_path = format!(
-        "/tmp/tap-tunnel-test-crash-{}.sock",
-        std::process::id()
-    );
+    let socket_path = format!("/tmp/tap-tunnel-test-crash-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
     // Create a namespace with a TCP echo server
@@ -1683,8 +1665,7 @@ async fn test_proxy_crash_fails_pending_tcp_connect() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Start proxy in socket-path mode
-    let mut proxy =
-        ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
+    let mut proxy = ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
 
     // Wait for socket to be created
     for _ in 0..50 {
@@ -1711,7 +1692,10 @@ async fn test_proxy_crash_fails_pending_tcp_connect() {
         .await
         .expect("initial write should work");
     let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).await.expect("initial read should work");
+    let n = stream
+        .read(&mut buf)
+        .await
+        .expect("initial read should work");
     assert_eq!(&buf[..n], b"ping\n");
     drop(stream);
 
@@ -1722,11 +1706,8 @@ async fn test_proxy_crash_fails_pending_tcp_connect() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Try to TCP connect - should fail with ConnectionAborted, not hang
-    let result = tokio::time::timeout(
-        Duration::from_secs(3),
-        tunnel.tcp_connect(server_addr),
-    )
-    .await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(3), tunnel.tcp_connect(server_addr)).await;
 
     match result {
         Ok(Ok(_)) => panic!("tcp_connect should fail after proxy is killed"),
@@ -1754,10 +1735,7 @@ async fn test_proxy_crash_fails_pending_tcp_connect() {
 async fn test_proxy_crash_udp_recv_does_not_hang() {
     init_logging();
 
-    let socket_path = format!(
-        "/tmp/tap-tunnel-test-udp-crash-{}.sock",
-        std::process::id()
-    );
+    let socket_path = format!("/tmp/tap-tunnel-test-udp-crash-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
     // Create a namespace
@@ -1766,8 +1744,7 @@ async fn test_proxy_crash_udp_recv_does_not_hang() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut proxy =
-        ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
+    let mut proxy = ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
 
     for _ in 0..50 {
         if std::path::Path::new(&socket_path).exists() {
@@ -1783,7 +1760,7 @@ async fn test_proxy_crash_udp_recv_does_not_hang() {
 
     // Bind a UDP socket
     let local_bind: SocketAddr = format!("{}:0", "10.0.0.2").parse().unwrap();
-    let mut socket = tunnel
+    let socket = tunnel
         .udp_bind(local_bind)
         .await
         .expect("failed to udp_bind");
@@ -1795,21 +1772,20 @@ async fn test_proxy_crash_udp_recv_does_not_hang() {
         .await
         .expect("send_to should work");
     let mut buf = [0u8; 64];
-    let (n, _) = socket.recv_from(&mut buf).await.expect("recv_from should work");
+    let (n, _) = socket
+        .recv_from(&mut buf)
+        .await
+        .expect("recv_from should work");
     assert_eq!(&buf[..n], b"echo: hello");
 
     // Kill the proxy
     proxy.kill();
 
     // recv_from should not hang forever - it should either error or timeout
-    let result = tokio::time::timeout(
-        Duration::from_secs(3),
-        socket.recv_from(&mut buf),
-    )
-    .await;
+    let result = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await;
 
     match result {
-        Ok(Ok(_)) => {} // Unlikely but acceptable if data was buffered
+        Ok(Ok(_)) => {}  // Unlikely but acceptable if data was buffered
         Ok(Err(_)) => {} // Got an error - good
         Err(_) => {
             // Timeout after 3 seconds is acceptable - the stack is shut down,

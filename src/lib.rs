@@ -210,19 +210,31 @@ struct TunnelInner {
     gateway: (IpAddr, [u8; 6]),
     /// Local IP (first IP added to the interface)
     local_addr: IpWithPrefix,
+    /// Whether close() has been called
+    closed: AtomicBool,
+}
+
+impl TunnelInner {
+    /// Kill the proxy child process if not already closed.
+    ///
+    /// Idempotent — the `closed` flag ensures the kill happens at most once.
+    fn close(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut guard) = self.proxy_child.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            *guard = None;
+        }
+    }
 }
 
 impl Drop for TunnelInner {
     fn drop(&mut self) {
-        // Clean up proxy process (if we spawned one)
-        // This happens first to stop sending frames to the stack
-        if let Ok(mut guard) = self.proxy_child.lock()
-            && let Some(ref mut child) = *guard
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
+        self.close();
         // The stack task will exit when:
         // 1. self.commands is dropped (after this method returns), disconnecting the channel
         // 2. The stack detects TryRecvError::Disconnected and returns
@@ -697,6 +709,7 @@ impl Tunnel {
                 proxy_child: Mutex::new(proxy_child),
                 gateway,
                 local_addr: (local_ip, local_prefix),
+                closed: AtomicBool::new(false),
             }),
         })
     }
@@ -868,6 +881,14 @@ impl Tunnel {
             .map_err(|_| broken_pipe("stack task gone"))?;
 
         rx.await.map_err(|_| broken_pipe("stack task gone"))
+    }
+
+    /// Explicitly close the tunnel, killing the proxy child process.
+    ///
+    /// This is idempotent — calling it multiple times is safe.
+    /// After closing, tunnel sockets will fail as the proxy is gone.
+    pub fn close(&self) {
+        self.inner.close();
     }
 
     /// Local IP (first IP added to the interface)

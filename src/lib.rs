@@ -66,13 +66,14 @@ use log::debug;
 use smoltcp::phy::FaultInjector;
 use socket::{TcpListener, TcpStream, UdpSocket};
 use stack::{ProxyDevice, StackCommand, StackConfig};
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
 
@@ -136,6 +137,13 @@ pub struct TapConfig {
     pub mac: Option<[u8; 6]>,
     /// Packet loss percentage for testing (0-100, default: 0)
     pub packet_loss_percent: u8,
+    /// Routes to add on the TAP interface in the namespace.
+    ///
+    /// Each entry is (destination, prefix_len), e.g. `(10.99.0.0, 24)`.
+    /// These are device routes (`ip route add <dest>/<prefix> dev <tap>`)
+    /// that allow the namespace kernel to route traffic for cross-subnet
+    /// IPs back through the TAP interface.
+    pub peer_routes: Vec<(IpAddr, u8)>,
 }
 
 impl Default for TapConfig {
@@ -146,6 +154,7 @@ impl Default for TapConfig {
             local_addr: None,
             mac: None,
             packet_loss_percent: 0,
+            peer_routes: Vec::new(),
         }
     }
 }
@@ -188,6 +197,16 @@ impl TapConfig {
         self.packet_loss_percent = percent;
         self
     }
+
+    /// Add a route on the TAP interface in the namespace.
+    ///
+    /// This creates a device route (`ip route add <dest>/<prefix> dev <tap>`)
+    /// so the namespace kernel routes traffic for these IPs through the TAP.
+    /// Needed when using `add_local_ip` with IPs outside the TAP subnet.
+    pub fn peer_route(mut self, dest: IpAddr, prefix_len: u8) -> Self {
+        self.peer_routes.push((dest, prefix_len));
+        self
+    }
 }
 
 /// A tunnel to a network namespace providing socket access via smoltcp.
@@ -201,9 +220,15 @@ pub struct Tunnel {
     inner: Arc<TunnelInner>,
 }
 
+/// Pending proxy response senders, keyed by request ID.
+type PendingProxyResponses =
+    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<io::Result<()>>>>>;
+
 struct TunnelInner {
     /// Channel to send commands to the stack task
     commands: CommandSender,
+    /// Channel to send control messages to the proxy via IPC
+    control_tx: Sender<Vec<u8>>,
     /// TAP proxy child process (None when using socket-path mode)
     proxy_child: Mutex<Option<Child>>,
     /// Gateway info from proxy: (tap_ip, tap_mac)
@@ -212,6 +237,10 @@ struct TunnelInner {
     local_addr: IpWithPrefix,
     /// Whether close() has been called
     closed: AtomicBool,
+    /// Atomic counter for proxy command request IDs
+    next_request_id: AtomicU64,
+    /// Map of pending proxy command responses
+    pending_proxy_responses: PendingProxyResponses,
 }
 
 impl TunnelInner {
@@ -346,6 +375,11 @@ fn spawn_proxy(pid: u32, frame_fd: OwnedFd, config: &TapConfig) -> io::Result<Ch
     // Configure the TAP interface with the peer address
     if let Some((ip, prefix)) = config.peer_addr {
         cmd.arg("--tap-addr").arg(format!("{}/{}", ip, prefix));
+    }
+
+    // Pass initial routes for the TAP interface
+    for (dest, prefix) in &config.peer_routes {
+        cmd.arg("--tap-route").arg(format!("{}/{}", dest, prefix));
     }
 
     let child = cmd.spawn().map_err(|e| {
@@ -604,6 +638,14 @@ impl Tunnel {
         let (frame_to_proxy_tx, mut frame_to_proxy_rx) =
             mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_CAPACITY);
 
+        // Control channel for sending proxy commands (route add/remove)
+        let (control_tx, mut control_rx) = mpsc::channel::<Vec<u8>>(32);
+
+        // Pending proxy responses (shared between API methods and IPC reader)
+        let pending_proxy_responses: PendingProxyResponses =
+            Arc::new(Mutex::new(HashMap::new()));
+        let pending_for_reader = Arc::clone(&pending_proxy_responses);
+
         // Generate MAC address
         let mac = config.mac.unwrap_or_else(|| {
             let mut mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -645,7 +687,7 @@ impl Tunnel {
 
         // Spawn IPC reader task (proxy -> stack)
         tokio::spawn(async move {
-            use protocol::{Message, decode_message};
+            use protocol::{Message, ProxyResponse, decode_control, decode_message};
             use tokio::io::AsyncReadExt;
 
             debug!("[IPC-RX] reader task starting");
@@ -664,8 +706,23 @@ impl Tunnel {
                                 break;
                             }
                         }
-                        Ok(Message::Control(_)) => {} // Ignore post-handshake control
-                        Err(_) => {}                  // Ignore decode errors
+                        Ok(Message::Control(payload)) => {
+                            // Try to decode as ProxyResponse and route to waiting caller
+                            if let Ok(resp) = decode_control::<ProxyResponse>(&payload) {
+                                let sender = {
+                                    pending_for_reader.lock().ok()
+                                        .and_then(|mut map| map.remove(&resp.id))
+                                };
+                                if let Some(tx) = sender {
+                                    let result = match resp.error {
+                                        None => Ok(()),
+                                        Some(msg) => Err(io::Error::other(msg)),
+                                    };
+                                    let _ = tx.send(result);
+                                }
+                            }
+                        }
+                        Err(_) => {} // Ignore decode errors
                     },
                     Err(e) => {
                         debug!("[IPC-RX] read error: {}", e);
@@ -676,21 +733,41 @@ impl Tunnel {
             }
         });
 
-        // Spawn IPC writer task (stack -> proxy)
+        // Spawn IPC writer task (stack -> proxy, and control messages -> proxy)
         tokio::spawn(async move {
             use protocol::encode_frame;
             use tokio::io::AsyncWriteExt;
 
             debug!("[IPC-TX] writer task starting");
-            while let Some(frame) = frame_to_proxy_rx.recv().await {
-                let msg = encode_frame(&frame);
-                if ipc_write_stream.write_all(&msg).await.is_err() {
-                    debug!("[IPC-TX] write error, proxy connection lost");
-                    ipc_dead_writer.store(true, Ordering::Relaxed);
-                    break;
+            loop {
+                tokio::select! {
+                    frame = frame_to_proxy_rx.recv() => {
+                        match frame {
+                            Some(frame) => {
+                                let msg = encode_frame(&frame);
+                                if ipc_write_stream.write_all(&msg).await.is_err() {
+                                    debug!("[IPC-TX] write error, proxy connection lost");
+                                    ipc_dead_writer.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                            None => break, // clean shutdown
+                        }
+                    }
+                    ctrl = control_rx.recv() => {
+                        match ctrl {
+                            Some(msg) => {
+                                if ipc_write_stream.write_all(&msg).await.is_err() {
+                                    debug!("[IPC-TX] write error on control, proxy connection lost");
+                                    ipc_dead_writer.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                            None => break, // clean shutdown
+                        }
+                    }
                 }
             }
-            // recv() returning None = clean shutdown (stack dropped), don't set ipc_dead
         });
 
         // Create device for smoltcp
@@ -706,10 +783,13 @@ impl Tunnel {
         Ok(Tunnel {
             inner: Arc::new(TunnelInner {
                 commands: cmd_tx,
+                control_tx,
                 proxy_child: Mutex::new(proxy_child),
                 gateway,
                 local_addr: (local_ip, local_prefix),
                 closed: AtomicBool::new(false),
+                next_request_id: AtomicU64::new(1),
+                pending_proxy_responses,
             }),
         })
     }
@@ -881,6 +961,64 @@ impl Tunnel {
             .map_err(|_| broken_pipe("stack task gone"))?;
 
         rx.await.map_err(|_| broken_pipe("stack task gone"))
+    }
+
+    /// Add a route on the TAP interface in the namespace.
+    ///
+    /// This tells the namespace kernel to route traffic for the given
+    /// destination through the TAP device, enabling cross-subnet communication.
+    /// Use this together with `add_local_ip` when the local IP is outside
+    /// the TAP interface's subnet.
+    pub async fn add_peer_route(&self, dest: IpAddr, prefix_len: u8) -> io::Result<()> {
+        self.send_proxy_command(protocol::ProxyCommand::AddRoute {
+            id: 0, // filled in by send_proxy_command
+            destination: dest,
+            prefix_len,
+        })
+        .await
+    }
+
+    /// Remove a route from the TAP interface in the namespace.
+    pub async fn remove_peer_route(&self, dest: IpAddr, prefix_len: u8) -> io::Result<()> {
+        self.send_proxy_command(protocol::ProxyCommand::RemoveRoute {
+            id: 0, // filled in by send_proxy_command
+            destination: dest,
+            prefix_len,
+        })
+        .await
+    }
+
+    /// Send a command to the proxy and wait for the response.
+    async fn send_proxy_command(&self, mut cmd: protocol::ProxyCommand) -> io::Result<()> {
+        let id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
+
+        // Set the ID on the command
+        match &mut cmd {
+            protocol::ProxyCommand::AddRoute { id: cid, .. } => *cid = id,
+            protocol::ProxyCommand::RemoveRoute { id: cid, .. } => *cid = id,
+        }
+
+        // Register a oneshot for the response
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut map = self
+                .inner
+                .pending_proxy_responses
+                .lock()
+                .map_err(|_| broken_pipe("response map poisoned"))?;
+            map.insert(id, tx);
+        }
+
+        // Encode and send the control message
+        let msg = protocol::encode_control(&cmd)?;
+        self.inner
+            .control_tx
+            .send(msg)
+            .await
+            .map_err(|_| broken_pipe("IPC writer gone"))?;
+
+        // Wait for response
+        rx.await.map_err(|_| broken_pipe("proxy response lost"))?
     }
 
     /// Explicitly close the tunnel, killing the proxy child process.

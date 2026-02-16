@@ -1797,6 +1797,118 @@ async fn test_proxy_crash_udp_recv_does_not_hang() {
     let _ = std::fs::remove_file(&socket_path);
 }
 
+// ============================================================================
+// Peer Route / Cross-Subnet Tests
+// ============================================================================
+
+/// Test cross-subnet TCP connectivity via peer routes.
+///
+/// Uses a local IP (10.99.0.50) outside the TAP subnet (10.0.0.0/24).
+/// A peer_route for 10.99.0.0/24 tells the namespace kernel to route
+/// traffic for that subnet through the TAP device.
+#[tokio::test]
+async fn test_peer_route_cross_subnet_tcp() {
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19700).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Configure tunnel with a peer route for the cross-subnet range
+    let config = TapConfig::new()
+        .interface_name("tap0")
+        .peer_addr(PEER_IP, PREFIX_LEN)
+        .local_addr(LOCAL_IP, PREFIX_LEN)
+        .peer_route(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 0)), 24);
+
+    let tunnel = Tunnel::connect_with_config(pid, config)
+        .await
+        .expect("failed to connect to namespace");
+
+    // Add the cross-subnet IP to the smoltcp stack
+    let cross_subnet_ip = IpAddr::V4(Ipv4Addr::new(10, 99, 0, 50));
+    tunnel
+        .add_local_ip(cross_subnet_ip, 24)
+        .await
+        .expect("failed to add cross-subnet IP");
+
+    // Verify the IP was added
+    let ips = tunnel.local_ips().await.expect("failed to get IPs");
+    assert!(
+        ips.iter().any(|(ip, _)| *ip == cross_subnet_ip),
+        "cross-subnet IP should be added"
+    );
+
+    // Connect from the cross-subnet IP
+    let server_addr: SocketAddr = format!("{}:19700", PEER_IP).parse().unwrap();
+    let mut stream = tunnel
+        .tcp_connect_from(cross_subnet_ip, server_addr)
+        .await
+        .expect("failed to tcp_connect_from cross-subnet IP");
+
+    // Send and receive data
+    stream
+        .write_all(b"cross-subnet hello\n")
+        .await
+        .expect("write failed");
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"cross-subnet hello\n");
+}
+
+/// Test dynamic peer route add/remove via the control channel.
+#[tokio::test]
+async fn test_peer_route_dynamic_add_remove() {
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19701).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    // Dynamically add a peer route
+    let route_dest = IpAddr::V4(Ipv4Addr::new(10, 88, 0, 0));
+    tunnel
+        .add_peer_route(route_dest, 24)
+        .await
+        .expect("failed to add peer route");
+
+    // Add corresponding local IP
+    let cross_ip = IpAddr::V4(Ipv4Addr::new(10, 88, 0, 42));
+    tunnel
+        .add_local_ip(cross_ip, 24)
+        .await
+        .expect("failed to add local IP");
+
+    // Connect from the cross-subnet IP
+    let server_addr: SocketAddr = format!("{}:19701", PEER_IP).parse().unwrap();
+    let mut stream = tunnel
+        .tcp_connect_from(cross_ip, server_addr)
+        .await
+        .expect("failed to tcp_connect_from dynamic route IP");
+
+    stream
+        .write_all(b"dynamic route\n")
+        .await
+        .expect("write failed");
+
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read failed");
+    assert_eq!(&buf[..n], b"dynamic route\n");
+
+    // Clean up: remove the route
+    tunnel
+        .remove_peer_route(route_dest, 24)
+        .await
+        .expect("failed to remove peer route");
+}
+
 /// Test that connect_to with a nonexistent socket path fails immediately
 /// (not related to our changes, but validates error path).
 #[tokio::test]

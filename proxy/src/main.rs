@@ -27,6 +27,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 mod ipc;
 mod namespace;
+mod route;
 mod tap;
 
 use ipc::{accept_seqpacket, create_seqpacket_listener};
@@ -34,7 +35,8 @@ use namespace::join_namespace;
 use tap::{configure_interface, create_tap};
 use tap_tunnel::TapConfig;
 use tap_tunnel::protocol::{
-    ClientHello, Message, ProxyConfig, decode_control, decode_message, encode_control, encode_frame,
+    ClientHello, Message, ProxyCommand, ProxyConfig, ProxyResponse, decode_control, decode_message,
+    encode_control, encode_frame,
 };
 
 /// Maximum Ethernet frame size (MTU 1500 + Ethernet header + some margin)
@@ -70,6 +72,10 @@ struct Args {
     /// Packet loss percentage for testing (0-100)
     #[arg(long, default_value = "0")]
     packet_loss: u8,
+
+    /// Routes to add on the TAP interface (repeatable, format: IP/PREFIX)
+    #[arg(long)]
+    tap_route: Vec<String>,
 }
 
 fn main() {
@@ -128,6 +134,14 @@ fn build_tap_config(args: &Args) -> TapConfig {
             config = config.peer_addr(ip, prefix);
         } else {
             error!("invalid tap-addr format: {}", addr_str);
+        }
+    }
+
+    for route_str in &args.tap_route {
+        if let Some((ip, prefix)) = parse_ip_prefix(route_str) {
+            config = config.peer_route(ip, prefix);
+        } else {
+            error!("invalid tap-route format: {}", route_str);
         }
     }
 
@@ -423,15 +437,89 @@ async fn run_proxy(
         debug!("sent gratuitous ARP for {}", ipv4);
     }
 
+    // Set up rtnetlink connection for route management
+    let (rt_conn, rt_handle, _) = rtnetlink::new_connection()
+        .map_err(|e| io::Error::other(format!("failed to create rtnetlink connection: {}", e)))?;
+    tokio::spawn(rt_conn);
+
+    // Add initial routes from CLI args
+    for (dest, prefix_len) in &config.peer_routes {
+        match route::add_route(&rt_handle, &config.interface_name, *dest, *prefix_len).await {
+            Ok(()) => debug!("added initial route {}/{} dev {}", dest, prefix_len, config.interface_name),
+            Err(e) => error!("failed to add initial route {}/{}: {}", dest, prefix_len, e),
+        }
+    }
+
     // Wrap TAP in async wrapper
     let tap = AsyncFdIo::new(tap_fd)?;
 
     // Run frame relay loop with protocol support
-    run_frame_relay(tap, frame_socket).await
+    run_frame_relay(tap, frame_socket, &rt_handle, &config.interface_name).await
+}
+
+/// Handle a proxy command and return a response.
+async fn handle_proxy_command(
+    cmd: ProxyCommand,
+    rt_handle: &rtnetlink::Handle,
+    iface_name: &str,
+) -> ProxyResponse {
+    match cmd {
+        ProxyCommand::AddRoute {
+            id,
+            destination,
+            prefix_len,
+        } => match route::add_route(rt_handle, iface_name, destination, prefix_len).await {
+            Ok(()) => {
+                debug!(
+                    "[PROXY] added route {}/{} dev {}",
+                    destination, prefix_len, iface_name
+                );
+                ProxyResponse { id, error: None }
+            }
+            Err(e) => {
+                error!(
+                    "[PROXY] failed to add route {}/{}: {}",
+                    destination, prefix_len, e
+                );
+                ProxyResponse {
+                    id,
+                    error: Some(e.to_string()),
+                }
+            }
+        },
+        ProxyCommand::RemoveRoute {
+            id,
+            destination,
+            prefix_len,
+        } => match route::remove_route(rt_handle, iface_name, destination, prefix_len).await {
+            Ok(()) => {
+                debug!(
+                    "[PROXY] removed route {}/{} dev {}",
+                    destination, prefix_len, iface_name
+                );
+                ProxyResponse { id, error: None }
+            }
+            Err(e) => {
+                error!(
+                    "[PROXY] failed to remove route {}/{}: {}",
+                    destination, prefix_len, e
+                );
+                ProxyResponse {
+                    id,
+                    error: Some(e.to_string()),
+                }
+            }
+        },
+    }
 }
 
 /// Run the frame relay loop - bidirectional Ethernet frame forwarding with protocol.
-async fn run_frame_relay(mut tap: AsyncFdIo, mut frame_socket: AsyncFdIo) -> io::Result<()> {
+async fn run_frame_relay(
+    mut tap: AsyncFdIo,
+    mut frame_socket: AsyncFdIo,
+    rt_handle: &rtnetlink::Handle,
+    iface_name: &str,
+) -> io::Result<()> {
     let mut tap_buf = vec![0u8; MAX_FRAME_SIZE];
     let mut sock_buf = vec![0u8; MAX_FRAME_SIZE + 1]; // Extra byte for type prefix
 
@@ -468,7 +556,18 @@ async fn run_frame_relay(mut tap: AsyncFdIo, mut frame_socket: AsyncFdIo) -> io:
                         tap.write_all(&frame).await?;
                     }
                     Ok(Message::Control(payload)) => {
-                        debug!("[PROXY] ignoring control message: {} bytes", payload.len());
+                        // Decode as ProxyCommand and handle it
+                        match decode_control::<ProxyCommand>(&payload) {
+                            Ok(cmd) => {
+                                let response = handle_proxy_command(cmd, rt_handle, iface_name).await;
+                                let response_msg = encode_control(&response)
+                                    .expect("failed to encode ProxyResponse");
+                                frame_socket.write_all(&response_msg).await?;
+                            }
+                            Err(e) => {
+                                debug!("[PROXY] failed to decode control message: {}", e);
+                            }
+                        }
                     }
                     Err(e) => {
                         debug!("[PROXY] decode error: {}", e);

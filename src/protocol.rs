@@ -37,6 +37,33 @@ pub struct ProxyConfig {
     pub prefix_len: u8,
 }
 
+/// Command sent from the library to the proxy over the control channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "cmd")]
+pub enum ProxyCommand {
+    /// Add a route to the TAP interface.
+    AddRoute {
+        id: u64,
+        destination: IpAddr,
+        prefix_len: u8,
+    },
+    /// Remove a route from the TAP interface.
+    RemoveRoute {
+        id: u64,
+        destination: IpAddr,
+        prefix_len: u8,
+    },
+}
+
+/// Response from the proxy to a command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyResponse {
+    /// Request ID matching the command.
+    pub id: u64,
+    /// Error message, if the command failed.
+    pub error: Option<String>,
+}
+
 /// Decoded message from the wire.
 #[derive(Debug)]
 pub enum Message {

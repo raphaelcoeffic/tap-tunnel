@@ -18,14 +18,15 @@
 //! Enable debug logging with:
 //!   RUST_LOG=debug cargo run --example udp_echo <PID>
 
-use log::{debug, info};
-use std::env;
-use std::net::{IpAddr, Ipv4Addr};
-use tap_tunnel::{TapConfig, Tunnel};
-use tokio::io::{AsyncBufReadExt, BufReader};
-
+#[cfg(target_os = "linux")]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use log::{debug, info};
+    use std::env;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tap_tunnel::{TapConfig, Tunnel};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     env_logger::init();
 
     let args: Vec<String> = env::args().collect();
@@ -106,4 +107,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("This example requires Linux (network namespaces).");
+    std::process::exit(1);
 }

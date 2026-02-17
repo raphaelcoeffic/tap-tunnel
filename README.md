@@ -167,9 +167,8 @@ async fn main() -> std::io::Result<()> {
     ).await?;
 
     // Get proxy's gateway info
-    if let Some((tap_ip, tap_mac)) = tunnel.gateway() {
-        println!("Gateway: {} ({:02x?})", tap_ip, tap_mac);
-    }
+    let (tap_ip, tap_mac) = tunnel.gateway();
+    println!("Gateway: {} ({:02x?})", tap_ip, tap_mac);
 
     // Add additional IPs dynamically
     tunnel.add_local_ip(Ipv4Addr::new(10, 0, 0, 10), 24).await?;
@@ -183,3 +182,45 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 ```
+
+## macOS Client Support
+
+The library supports running the client on macOS while the proxy runs inside a
+Linux container. The proxy binary itself is Linux-only (it needs TAP devices and
+network namespaces), but the `Tunnel::connect_to()` API works on macOS via
+Unix STREAM sockets.
+
+**Setup:** run the proxy inside a Linux container and publish its Unix socket to
+the macOS host:
+
+```bash
+# Start the proxy inside a Linux container, publishing the socket to the host
+docker run --rm \
+  -v /tmp/tunnel:/shared \
+  my-image \
+  tap-tunnel-proxy --socket-path /shared/frame.sock --tap-addr 10.0.0.1/24
+```
+
+Then connect from macOS:
+
+```rust
+use tap_tunnel::Tunnel;
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let tunnel = Tunnel::connect_to("/tmp/tunnel/frame.sock", None).await?;
+
+    let mut stream = tunnel.tcp_connect("10.0.0.1:8080".parse()?).await?;
+    // ...
+    Ok(())
+}
+```
+
+**Platform availability:**
+
+| API | Linux | macOS |
+|-----|-------|-------|
+| `Tunnel::connect(pid)` | Yes | No (needs namespaces) |
+| `Tunnel::connect_with_config(pid, config)` | Yes | No (needs namespaces) |
+| `Tunnel::connect_to(socket_path, local_ip)` | Yes | Yes |
+| `tap-tunnel-proxy` binary | Yes | No (needs TAP, namespaces, rtnetlink) |

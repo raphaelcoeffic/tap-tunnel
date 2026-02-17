@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Size of the length prefix in bytes (4 bytes, little-endian u32).
+pub const LENGTH_PREFIX_SIZE: usize = 4;
+
+/// Maximum message size (16 MB safety limit).
+pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 /// Message type byte for control messages.
 pub const MSG_TYPE_CONTROL: u8 = 0x00;
 
@@ -120,6 +126,93 @@ pub fn decode_message(data: &[u8]) -> io::Result<Message> {
             format!("unknown message type: 0x{:02x}", msg_type),
         )),
     }
+}
+
+// ============================================================================
+// Length-prefixed framing for SOCK_STREAM transport
+// ============================================================================
+
+/// Write a length-prefixed message (blocking).
+///
+/// Wire format: `[4-byte LE length][payload]`
+pub fn write_framed(writer: &mut impl io::Write, msg: &[u8]) -> io::Result<()> {
+    let len = msg.len();
+    if len > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "message too large: {} bytes (max {})",
+                len, MAX_MESSAGE_SIZE
+            ),
+        ));
+    }
+    writer.write_all(&(len as u32).to_le_bytes())?;
+    writer.write_all(msg)?;
+    Ok(())
+}
+
+/// Read a length-prefixed message (blocking).
+///
+/// Returns the payload bytes. Returns `UnexpectedEof` if the connection closes.
+pub fn read_framed(reader: &mut impl io::Read) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "framed message too large: {} bytes (max {})",
+                len, MAX_MESSAGE_SIZE
+            ),
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Write a length-prefixed message (async).
+pub async fn write_framed_async(
+    writer: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+    msg: &[u8],
+) -> io::Result<()> {
+    let len = msg.len();
+    if len > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "message too large: {} bytes (max {})",
+                len, MAX_MESSAGE_SIZE
+            ),
+        ));
+    }
+    writer.write_all(&(len as u32).to_le_bytes()).await?;
+    writer.write_all(msg).await?;
+    Ok(())
+}
+
+/// Read a length-prefixed message (async).
+///
+/// Returns the payload bytes. Returns `UnexpectedEof` if the connection closes.
+pub async fn read_framed_async(
+    reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; LENGTH_PREFIX_SIZE];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "framed message too large: {} bytes (max {})",
+                len, MAX_MESSAGE_SIZE
+            ),
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
 }
 
 /// Compute the default client IP from the TAP IP (tap_ip + 1).
@@ -273,6 +366,63 @@ mod tests {
             tap_ip,
             64
         ));
+    }
+
+    #[test]
+    fn test_framed_roundtrip() {
+        let msg = b"hello framed world";
+        let mut buf = Vec::new();
+        write_framed(&mut buf, msg).unwrap();
+
+        // Verify wire format: 4-byte LE length + payload
+        assert_eq!(buf.len(), LENGTH_PREFIX_SIZE + msg.len());
+        let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        assert_eq!(len, msg.len());
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let decoded = read_framed(&mut cursor).unwrap();
+        assert_eq!(&decoded, msg);
+    }
+
+    #[test]
+    fn test_framed_empty_message() {
+        let msg = b"";
+        let mut buf = Vec::new();
+        write_framed(&mut buf, msg).unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let decoded = read_framed(&mut cursor).unwrap();
+        assert_eq!(&decoded, msg);
+    }
+
+    #[test]
+    fn test_framed_oversized_write_rejected() {
+        let msg = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let mut buf = Vec::new();
+        let result = write_framed(&mut buf, &msg);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_framed_oversized_read_rejected() {
+        // Craft a frame header claiming a size larger than MAX_MESSAGE_SIZE
+        let fake_len = (MAX_MESSAGE_SIZE as u32 + 1).to_le_bytes();
+        let mut cursor = std::io::Cursor::new(fake_len.to_vec());
+        let result = read_framed(&mut cursor);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_framed_async_roundtrip() {
+        let msg = b"async framed message";
+        let mut buf = Vec::new();
+        write_framed_async(&mut buf, msg).await.unwrap();
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let decoded = read_framed_async(&mut cursor).await.unwrap();
+        assert_eq!(&decoded, msg);
     }
 
     #[test]

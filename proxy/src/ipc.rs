@@ -2,12 +2,12 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
-/// Create a listening SEQPACKET socket at the given path.
+/// Create a listening STREAM socket at the given path.
 ///
 /// The socket is bound to the given path and set to listen for incoming connections.
-pub fn create_seqpacket_listener(path: &Path) -> io::Result<OwnedFd> {
-    // Create SEQPACKET socket
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+pub fn create_stream_listener(path: &Path) -> io::Result<OwnedFd> {
+    // Create STREAM socket
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -52,10 +52,10 @@ pub fn create_seqpacket_listener(path: &Path) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// Accept a connection on a SEQPACKET listener.
+/// Accept a connection on a STREAM listener.
 ///
 /// Blocks until a client connects. Returns the connected socket FD.
-pub fn accept_seqpacket(listener: &OwnedFd) -> io::Result<OwnedFd> {
+pub fn accept_stream(listener: &OwnedFd) -> io::Result<OwnedFd> {
     let fd = unsafe {
         libc::accept4(
             listener.as_raw_fd(),

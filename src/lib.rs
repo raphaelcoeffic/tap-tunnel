@@ -69,10 +69,13 @@ use stack::{ProxyDevice, StackCommand, StackConfig};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
@@ -234,8 +237,7 @@ pub struct Tunnel {
 }
 
 /// Pending proxy response senders, keyed by request ID.
-type PendingProxyResponses =
-    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<io::Result<()>>>>>;
+type PendingProxyResponses = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<io::Result<()>>>>>;
 
 struct TunnelInner {
     /// Channel to send commands to the stack task
@@ -286,6 +288,7 @@ impl Drop for TunnelInner {
 }
 
 /// Find the proxy binary path.
+#[cfg(target_os = "linux")]
 fn find_proxy_binary() -> io::Result<std::path::PathBuf> {
     const PROXY_NAME: &str = "tap-tunnel-proxy";
 
@@ -358,6 +361,7 @@ fn find_proxy_binary() -> io::Result<std::path::PathBuf> {
 }
 
 /// Remove the CLOEXEC flag from a file descriptor so it's inherited across exec.
+#[cfg(target_os = "linux")]
 fn remove_cloexec(fd: &OwnedFd) -> io::Result<()> {
     let raw_fd = fd.as_raw_fd();
     let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFD) };
@@ -373,6 +377,7 @@ fn remove_cloexec(fd: &OwnedFd) -> io::Result<()> {
 }
 
 /// Spawn the proxy binary.
+#[cfg(target_os = "linux")]
 fn spawn_proxy(pid: u32, frame_fd: OwnedFd, config: &TapConfig) -> io::Result<Child> {
     remove_cloexec(&frame_fd)?;
 
@@ -415,6 +420,7 @@ fn spawn_proxy(pid: u32, frame_fd: OwnedFd, config: &TapConfig) -> io::Result<Ch
 }
 
 /// Convert an OwnedFd to a UnixStream.
+#[cfg(target_os = "linux")]
 fn fd_to_unix_stream(fd: OwnedFd) -> io::Result<UnixStream> {
     let raw_fd = fd.into_raw_fd();
     let stream = unsafe { UnixStream::from_raw_fd(raw_fd) };
@@ -422,6 +428,7 @@ fn fd_to_unix_stream(fd: OwnedFd) -> io::Result<UnixStream> {
 }
 
 /// Read stderr from a child process (best-effort, for error reporting).
+#[cfg(target_os = "linux")]
 fn read_child_stderr(child: &mut Child) -> String {
     use std::io::Read;
     child
@@ -438,6 +445,7 @@ fn read_child_stderr(child: &mut Child) -> String {
 
 impl Tunnel {
     /// Connect to the network namespace of the given PID with default configuration.
+    #[cfg(target_os = "linux")]
     pub async fn connect(pid: u32) -> io::Result<Self> {
         Self::connect_with_config(pid, TapConfig::default()).await
     }
@@ -445,19 +453,20 @@ impl Tunnel {
     /// Connect to the network namespace of the given PID with custom configuration.
     ///
     /// This spawns a TAP proxy process and starts a smoltcp stack task.
+    #[cfg(target_os = "linux")]
     pub async fn connect_with_config(pid: u32, config: TapConfig) -> io::Result<Self> {
         Self::connect_with_config_blocking(pid, config)
     }
 
     /// Synchronous version of connect_with_config.
+    #[cfg(target_os = "linux")]
     pub fn connect_with_config_blocking(pid: u32, mut config: TapConfig) -> io::Result<Self> {
         use protocol::{
             ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
-            encode_control,
+            encode_control, read_framed, write_framed,
         };
-        use std::io::{Read, Write};
 
-        // Create socketpair for frame relay (SEQPACKET for message boundaries)
+        // Create socketpair for frame relay
         let (parent_fd, child_fd) = ipc::create_socketpair()?;
 
         // Spawn the proxy process
@@ -469,16 +478,16 @@ impl Tunnel {
         // Send ClientHello (now empty - client manages its own IPs)
         let hello = ClientHello::default();
         let hello_msg = encode_control(&hello)?;
-        stream.write_all(&hello_msg)?;
+        write_framed(&mut stream, &hello_msg)?;
         debug!("sent ClientHello: {:?}", hello);
 
         // Receive ProxyConfig with timeout and child-exit monitoring
-        let mut buf = [0u8; 1024];
         stream.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let n = loop {
-            match stream.read(&mut buf) {
-                Ok(0) => {
+        let data = loop {
+            match read_framed(&mut stream) {
+                Ok(data) => break data,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     let stderr = read_child_stderr(&mut proxy_child);
                     let msg = if stderr.is_empty() {
                         "proxy closed connection during handshake".to_string()
@@ -487,7 +496,6 @@ impl Tunnel {
                     };
                     return Err(unexpected_eof(&msg));
                 }
-                Ok(n) => break n,
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut =>
@@ -514,7 +522,7 @@ impl Tunnel {
         // Restore blocking mode for IPC after handshake
         stream.set_read_timeout(None)?;
 
-        let msg = decode_message(&buf[..n])?;
+        let msg = decode_message(&data)?;
         let proxy_config: ProxyConfig = match msg {
             Message::Control(payload) => decode_control(&payload)?,
             Message::Frame(_) => {
@@ -588,35 +596,27 @@ impl Tunnel {
     ) -> io::Result<Self> {
         use protocol::{
             ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
-            encode_control,
+            encode_control, read_framed, write_framed,
         };
-        use std::io::{Read, Write};
 
         let socket_path = socket_path.as_ref();
 
-        // Connect to the proxy's listening socket
-        let frame_fd = ipc::connect_seqpacket(socket_path)?;
+        // Connect to the proxy's listening socket (STREAM)
+        let mut stream = ipc::connect_stream(socket_path)?;
         debug!("connected to proxy at {:?}", socket_path);
-
-        // Convert to UnixStream for handshake
-        let mut stream = fd_to_unix_stream(frame_fd)?;
 
         // Send ClientHello (empty - client manages its own IPs)
         let hello = ClientHello::default();
         let hello_msg = encode_control(&hello)?;
-        stream.write_all(&hello_msg)?;
+        write_framed(&mut stream, &hello_msg)?;
         debug!("sent ClientHello: {:?}", hello);
 
         // Receive ProxyConfig with timeout
-        let mut buf = [0u8; 1024];
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Err(unexpected_eof("proxy closed connection during handshake"));
-        }
+        let data = read_framed(&mut stream)?;
         stream.set_read_timeout(None)?;
 
-        let msg = decode_message(&buf[..n])?;
+        let msg = decode_message(&data)?;
         let proxy_config: ProxyConfig = match msg {
             Message::Control(payload) => decode_control(&payload)?,
             Message::Frame(_) => {
@@ -641,9 +641,9 @@ impl Tunnel {
         Self::setup_stack_from_fd(stream, config, None, gateway)
     }
 
-    /// Common setup code: given a connected frame FD, set up channels, IPC tasks, and stack.
+    /// Common setup code: given a connected Unix stream, set up channels, IPC tasks, and stack.
     ///
-    /// Messages are prefixed with a type byte (0x00=control, 0x01=frame).
+    /// Messages use length-prefixed framing with a type byte (0x00=control, 0x01=frame).
     fn setup_stack_from_fd(
         frame_stream: UnixStream,
         config: TapConfig,
@@ -660,8 +660,7 @@ impl Tunnel {
         let (control_tx, mut control_rx) = mpsc::channel::<Vec<u8>>(32);
 
         // Pending proxy responses (shared between API methods and IPC reader)
-        let pending_proxy_responses: PendingProxyResponses =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending_proxy_responses: PendingProxyResponses = Arc::new(Mutex::new(HashMap::new()));
         let pending_for_reader = Arc::clone(&pending_proxy_responses);
 
         // Generate MAC address
@@ -703,24 +702,16 @@ impl Tunnel {
         let ipc_dead_reader = Arc::clone(&ipc_dead);
         let ipc_dead_writer = Arc::clone(&ipc_dead);
 
-        // Compute buffer sizes from configured MTU
-        let ipc_buffer_size = config.mtu as usize + 100;
-
         // Spawn IPC reader task (proxy -> stack)
         tokio::spawn(async move {
-            use protocol::{Message, ProxyResponse, decode_control, decode_message};
-            use tokio::io::AsyncReadExt;
+            use protocol::{
+                Message, ProxyResponse, decode_control, decode_message, read_framed_async,
+            };
 
             debug!("[IPC-RX] reader task starting");
-            let mut buf = vec![0u8; ipc_buffer_size];
             loop {
-                match ipc_read_stream.read(&mut buf).await {
-                    Ok(0) => {
-                        debug!("[IPC-RX] proxy closed connection");
-                        ipc_dead_reader.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                    Ok(n) => match decode_message(&buf[..n]) {
+                match read_framed_async(&mut ipc_read_stream).await {
+                    Ok(data) => match decode_message(&data) {
                         Ok(Message::Frame(frame)) => {
                             if frame_tx.send(frame).await.is_err() {
                                 // Stack dropped first - clean shutdown, don't set ipc_dead
@@ -731,7 +722,9 @@ impl Tunnel {
                             // Try to decode as ProxyResponse and route to waiting caller
                             if let Ok(resp) = decode_control::<ProxyResponse>(&payload) {
                                 let sender = {
-                                    pending_for_reader.lock().ok()
+                                    pending_for_reader
+                                        .lock()
+                                        .ok()
                                         .and_then(|mut map| map.remove(&resp.id))
                                 };
                                 if let Some(tx) = sender {
@@ -745,6 +738,11 @@ impl Tunnel {
                         }
                         Err(_) => {} // Ignore decode errors
                     },
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        debug!("[IPC-RX] proxy closed connection");
+                        ipc_dead_reader.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     Err(e) => {
                         debug!("[IPC-RX] read error: {}", e);
                         ipc_dead_reader.store(true, Ordering::Relaxed);
@@ -756,8 +754,7 @@ impl Tunnel {
 
         // Spawn IPC writer task (stack -> proxy, and control messages -> proxy)
         tokio::spawn(async move {
-            use protocol::encode_frame;
-            use tokio::io::AsyncWriteExt;
+            use protocol::{encode_frame, write_framed_async};
 
             debug!("[IPC-TX] writer task starting");
             loop {
@@ -766,7 +763,7 @@ impl Tunnel {
                         match frame {
                             Some(frame) => {
                                 let msg = encode_frame(&frame);
-                                if ipc_write_stream.write_all(&msg).await.is_err() {
+                                if write_framed_async(&mut ipc_write_stream, &msg).await.is_err() {
                                     debug!("[IPC-TX] write error, proxy connection lost");
                                     ipc_dead_writer.store(true, Ordering::Relaxed);
                                     break;
@@ -778,7 +775,7 @@ impl Tunnel {
                     ctrl = control_rx.recv() => {
                         match ctrl {
                             Some(msg) => {
-                                if ipc_write_stream.write_all(&msg).await.is_err() {
+                                if write_framed_async(&mut ipc_write_stream, &msg).await.is_err() {
                                     debug!("[IPC-TX] write error on control, proxy connection lost");
                                     ipc_dead_writer.store(true, Ordering::Relaxed);
                                     break;
@@ -1099,6 +1096,7 @@ fn invalid_data(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
 
+#[cfg(target_os = "linux")]
 fn unexpected_eof(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, msg)
 }

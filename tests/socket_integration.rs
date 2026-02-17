@@ -1909,6 +1909,116 @@ async fn test_peer_route_dynamic_add_remove() {
         .expect("failed to remove peer route");
 }
 
+// ============================================================================
+// Custom MTU Tests
+// ============================================================================
+
+/// Test that a large MTU (4000) allows sending UDP datagrams bigger than
+/// the standard 1500-byte MTU. A single 3000-byte UDP payload would not
+/// fit in a standard Ethernet frame but fits with MTU 4000.
+#[tokio::test]
+async fn test_custom_mtu_large_udp() {
+    init_logging();
+
+    let ns_proc = udp_echo_server_ns(19800).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = TapConfig::new()
+        .interface_name("tap0")
+        .peer_addr(PEER_IP, PREFIX_LEN)
+        .local_addr(LOCAL_IP, PREFIX_LEN)
+        .mtu(4000);
+
+    let tunnel = Tunnel::connect_with_config(pid, config)
+        .await
+        .expect("failed to connect to namespace");
+
+    let local_bind: SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
+    let socket = tunnel
+        .udp_bind(local_bind)
+        .await
+        .expect("failed to udp_bind");
+
+    // Send a 3000-byte UDP payload — larger than default 1500 MTU.
+    // With MTU 4000 the IP packet fits in a single Ethernet frame.
+    let payload = vec![0xAB_u8; 3000];
+    let server_addr: SocketAddr = format!("{}:19800", PEER_IP).parse().unwrap();
+    socket
+        .send_to(&payload, server_addr)
+        .await
+        .expect("send_to failed");
+
+    // Receive the echo response (server prepends "echo: ")
+    let mut buf = vec![0u8; 4096];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+        .await
+        .expect("recv_from timed out")
+        .expect("recv_from failed");
+    assert_eq!(from.port(), 19800);
+    // "echo: " is 6 bytes
+    assert_eq!(n, 3000 + 6, "response should be payload + echo prefix");
+    assert_eq!(&buf[..6], b"echo: ");
+    assert_eq!(&buf[6..n], &payload[..]);
+}
+
+/// Test that a small MTU (512) still allows TCP to work. smoltcp will
+/// use smaller segments, and the data still arrives correctly.
+#[tokio::test]
+async fn test_custom_mtu_small_tcp() {
+    init_logging();
+
+    let ns_proc = tcp_echo_server_ns(19801).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = TapConfig::new()
+        .interface_name("tap0")
+        .peer_addr(PEER_IP, PREFIX_LEN)
+        .local_addr(LOCAL_IP, PREFIX_LEN)
+        .mtu(512);
+
+    let tunnel = Tunnel::connect_with_config(pid, config)
+        .await
+        .expect("failed to connect to namespace");
+
+    let server_addr: SocketAddr = format!("{}:19801", PEER_IP).parse().unwrap();
+    let mut stream = tunnel
+        .tcp_connect(server_addr)
+        .await
+        .expect("failed to tcp_connect");
+
+    // Send 4KB of data — much larger than the 512 MTU.
+    // TCP will segment into smaller packets automatically.
+    let data = vec![0x42_u8; 4096];
+    stream.write_all(&data).await.expect("write failed");
+
+    // Read all echoed data back
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while received.len() < data.len() {
+        if tokio::time::Instant::now() > deadline {
+            panic!(
+                "timeout: received {} of {} bytes",
+                received.len(),
+                data.len()
+            );
+        }
+        let mut buf = [0u8; 2048];
+        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
+            Ok(Err(e)) => panic!("read error: {}", e),
+            Err(_) => continue,
+        }
+    }
+
+    assert_eq!(received.len(), data.len());
+    assert_eq!(&received[..], &data[..]);
+}
+
 /// Test that connect_to with a nonexistent socket path fails immediately
 /// (not related to our changes, but validates error path).
 #[tokio::test]

@@ -92,15 +92,11 @@ const COMMAND_CHANNEL_CAPACITY: usize = 256;
 /// This limits how many Ethernet frames can be buffered in each direction.
 const FRAME_CHANNEL_CAPACITY: usize = 256;
 
-/// Maximum Ethernet frame size (MTU + Ethernet header).
-///
-/// Standard Ethernet MTU is 1500 bytes, plus 14 bytes for the Ethernet header.
-const ETHERNET_MAX_FRAME_SIZE: usize = 1514;
+/// Default IP-level MTU (Maximum Transmission Unit).
+const DEFAULT_MTU: u16 = 1500;
 
-/// Buffer size for reading frames from IPC.
-///
-/// Slightly larger than max frame size to handle any framing overhead.
-const IPC_READ_BUFFER_SIZE: usize = 1600;
+/// Ethernet header size in bytes.
+const ETHERNET_HEADER_SIZE: usize = 14;
 
 /// Default backlog for TCP listeners.
 ///
@@ -144,6 +140,12 @@ pub struct TapConfig {
     /// that allow the namespace kernel to route traffic for cross-subnet
     /// IPs back through the TAP interface.
     pub peer_routes: Vec<(IpAddr, u8)>,
+    /// IP-level MTU (Maximum Transmission Unit) in bytes.
+    ///
+    /// This controls the maximum size of IP packets on the tunnel link.
+    /// Standard Ethernet is 1500; set higher for jumbo frames or lower
+    /// for constrained environments. Default: 1500.
+    pub mtu: u16,
 }
 
 impl Default for TapConfig {
@@ -155,6 +157,7 @@ impl Default for TapConfig {
             mac: None,
             packet_loss_percent: 0,
             peer_routes: Vec::new(),
+            mtu: DEFAULT_MTU,
         }
     }
 }
@@ -205,6 +208,16 @@ impl TapConfig {
     /// Needed when using `add_local_ip` with IPs outside the TAP subnet.
     pub fn peer_route(mut self, dest: IpAddr, prefix_len: u8) -> Self {
         self.peer_routes.push((dest, prefix_len));
+        self
+    }
+
+    /// Set the IP-level MTU (Maximum Transmission Unit) in bytes.
+    ///
+    /// Controls the maximum IP packet size on the tunnel link.
+    /// Default is 1500 (standard Ethernet). Use larger values for
+    /// jumbo frames or smaller values for constrained environments.
+    pub fn mtu(mut self, mtu: u16) -> Self {
+        self.mtu = mtu;
         self
     }
 }
@@ -377,6 +390,8 @@ fn spawn_proxy(pid: u32, frame_fd: OwnedFd, config: &TapConfig) -> io::Result<Ch
         cmd.arg("--tap-addr").arg(format!("{}/{}", ip, prefix));
     }
 
+    cmd.arg("--mtu").arg(config.mtu.to_string());
+
     // Pass initial routes for the TAP interface
     for (dest, prefix) in &config.peer_routes {
         cmd.arg("--tap-route").arg(format!("{}/{}", dest, prefix));
@@ -517,10 +532,12 @@ impl Tunnel {
             .map(|(ip, _)| ip)
             .unwrap_or_else(|| default_client_ip(proxy_config.tap_ip));
 
-        // Update config with proxy info and client-picked IP
+        // Update config with proxy info and client-picked IP.
+        // Use the MTU reported by the proxy (the TAP device's actual MTU).
         config = config
             .peer_addr(proxy_config.tap_ip, proxy_config.prefix_len)
-            .local_addr(client_ip, proxy_config.prefix_len);
+            .local_addr(client_ip, proxy_config.prefix_len)
+            .mtu(proxy_config.mtu);
 
         // Use PID-based MAC if not explicitly set
         if config.mac.is_none() {
@@ -614,10 +631,11 @@ impl Tunnel {
         // Client picks its own IP: use provided local_ip or default (tap_ip + 1)
         let client_ip = local_ip.unwrap_or_else(|| default_client_ip(proxy_config.tap_ip));
 
-        // Build TapConfig from received config
+        // Build TapConfig from received config, using the proxy's reported MTU
         let config = TapConfig::new()
             .peer_addr(proxy_config.tap_ip, proxy_config.prefix_len)
-            .local_addr(client_ip, proxy_config.prefix_len);
+            .local_addr(client_ip, proxy_config.prefix_len)
+            .mtu(proxy_config.mtu);
 
         // Set up the stack with protocol-aware IPC
         Self::setup_stack_from_fd(stream, config, None, gateway)
@@ -685,13 +703,16 @@ impl Tunnel {
         let ipc_dead_reader = Arc::clone(&ipc_dead);
         let ipc_dead_writer = Arc::clone(&ipc_dead);
 
+        // Compute buffer sizes from configured MTU
+        let ipc_buffer_size = config.mtu as usize + 100;
+
         // Spawn IPC reader task (proxy -> stack)
         tokio::spawn(async move {
             use protocol::{Message, ProxyResponse, decode_control, decode_message};
             use tokio::io::AsyncReadExt;
 
             debug!("[IPC-RX] reader task starting");
-            let mut buf = [0u8; IPC_READ_BUFFER_SIZE];
+            let mut buf = vec![0u8; ipc_buffer_size];
             loop {
                 match ipc_read_stream.read(&mut buf).await {
                     Ok(0) => {
@@ -771,14 +792,25 @@ impl Tunnel {
         });
 
         // Create device for smoltcp
-        let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, ETHERNET_MAX_FRAME_SIZE);
-        let mut device = FaultInjector::new(device, random_seed());
-        device.set_drop_chance(config.packet_loss_percent);
+        let ethernet_frame_size = config.mtu as usize + ETHERNET_HEADER_SIZE;
+        let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, ethernet_frame_size);
 
-        // Spawn stack task (will exit when command channel disconnects or IPC dies)
-        tokio::spawn(async move {
-            stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead).await;
-        });
+        // Spawn stack task (will exit when command channel disconnects or IPC dies).
+        // Only wrap with FaultInjector when packet loss is configured, because
+        // FaultInjector caps MTU at 1536 (smoltcp internal limit).
+        let packet_loss = config.packet_loss_percent;
+        if packet_loss > 0 {
+            let mut device = FaultInjector::new(device, random_seed());
+            device.set_drop_chance(packet_loss);
+            tokio::spawn(async move {
+                stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead).await;
+            });
+        } else {
+            let mut device = device;
+            tokio::spawn(async move {
+                stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead).await;
+            });
+        }
 
         Ok(Tunnel {
             inner: Arc::new(TunnelInner {

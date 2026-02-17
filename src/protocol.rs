@@ -35,6 +35,13 @@ pub struct ProxyConfig {
     pub tap_mac: [u8; 6],
     /// Subnet prefix length.
     pub prefix_len: u8,
+    /// IP-level MTU of the TAP interface.
+    #[serde(default = "default_mtu")]
+    pub mtu: u16,
+}
+
+fn default_mtu() -> u16 {
+    1500
 }
 
 /// Command sent from the library to the proxy over the control channel.
@@ -169,10 +176,11 @@ impl std::fmt::Display for ProxyConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "tap_ip={}, tap_mac={}, prefix_len={}",
+            "tap_ip={}, tap_mac={}, prefix_len={}, mtu={}",
             self.tap_ip,
             PrettyHwAddr(&self.tap_mac),
-            self.prefix_len
+            self.prefix_len,
+            self.mtu
         )
     }
 }

@@ -39,8 +39,8 @@ use tap_tunnel::protocol::{
     encode_control, encode_frame,
 };
 
-/// Maximum Ethernet frame size (MTU 1500 + Ethernet header + some margin)
-const MAX_FRAME_SIZE: usize = 1522;
+/// Ethernet header size in bytes.
+const ETHERNET_HEADER_SIZE: usize = 14;
 
 #[derive(Parser, Debug)]
 #[command(name = "tap-tunnel-proxy")]
@@ -76,6 +76,10 @@ struct Args {
     /// Routes to add on the TAP interface (repeatable, format: IP/PREFIX)
     #[arg(long)]
     tap_route: Vec<String>,
+
+    /// IP-level MTU for the TAP interface (default: 1500)
+    #[arg(long, default_value = "1500")]
+    mtu: u16,
 }
 
 fn main() {
@@ -127,7 +131,8 @@ fn main() {
 fn build_tap_config(args: &Args) -> TapConfig {
     let mut config = TapConfig::new()
         .interface_name(&args.tap_name)
-        .packet_loss_percent(args.packet_loss);
+        .packet_loss_percent(args.packet_loss)
+        .mtu(args.mtu);
 
     if let Some(addr_str) = &args.tap_addr {
         if let Some((ip, prefix)) = parse_ip_prefix(addr_str) {
@@ -173,10 +178,18 @@ fn run(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
     let tap_fd = create_tap(&config.interface_name)?;
     debug!("created TAP interface: {}", config.interface_name);
 
-    // Configure IP (if specified), bring up, and get MAC address
-    let tap_mac = configure_interface(&config.interface_name, config.peer_addr)?;
+    // Configure IP (if specified), set MTU, bring up, and get MAC address
+    let mtu_opt = if config.mtu != 1500 {
+        Some(config.mtu)
+    } else {
+        None
+    };
+    let tap_mac = configure_interface(&config.interface_name, config.peer_addr, mtu_opt)?;
     if let Some((ip, prefix_len)) = config.peer_addr {
         debug!("configured IP: {}/{}", ip, prefix_len);
+    }
+    if config.mtu != 1500 {
+        debug!("configured MTU: {}", config.mtu);
     }
     debug!("interface {} is up", config.interface_name);
     debug!(
@@ -252,6 +265,7 @@ fn perform_handshake(fd: &OwnedFd, config: &TapConfig, tap_mac: [u8; 6]) -> io::
         tap_ip,
         tap_mac,
         prefix_len,
+        mtu: config.mtu,
     };
     let config_msg = encode_control(&proxy_config)?;
     let written = unsafe {
@@ -453,8 +467,11 @@ async fn run_proxy(
     // Wrap TAP in async wrapper
     let tap = AsyncFdIo::new(tap_fd)?;
 
+    // Compute max frame size from configured MTU
+    let max_frame_size = config.mtu as usize + ETHERNET_HEADER_SIZE;
+
     // Run frame relay loop with protocol support
-    run_frame_relay(tap, frame_socket, &rt_handle, &config.interface_name).await
+    run_frame_relay(tap, frame_socket, &rt_handle, &config.interface_name, max_frame_size).await
 }
 
 /// Handle a proxy command and return a response.
@@ -519,9 +536,10 @@ async fn run_frame_relay(
     mut frame_socket: AsyncFdIo,
     rt_handle: &rtnetlink::Handle,
     iface_name: &str,
+    max_frame_size: usize,
 ) -> io::Result<()> {
-    let mut tap_buf = vec![0u8; MAX_FRAME_SIZE];
-    let mut sock_buf = vec![0u8; MAX_FRAME_SIZE + 1]; // Extra byte for type prefix
+    let mut tap_buf = vec![0u8; max_frame_size];
+    let mut sock_buf = vec![0u8; max_frame_size + 1]; // Extra byte for type prefix
 
     debug!("[PROXY] frame relay starting");
 

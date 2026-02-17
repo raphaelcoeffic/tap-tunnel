@@ -60,9 +60,13 @@ pub fn create_tap(name: &str) -> io::Result<OwnedFd> {
     Ok(owned_fd)
 }
 
-/// Configure a network interface: optionally add an IP address, bring it up,
-/// and return its MAC address.
-pub fn configure_interface(name: &str, addr: Option<(IpAddr, u8)>) -> io::Result<[u8; 6]> {
+/// Configure a network interface: optionally add an IP address and set MTU,
+/// bring it up, and return its MAC address.
+pub fn configure_interface(
+    name: &str,
+    addr: Option<(IpAddr, u8)>,
+    mtu: Option<u16>,
+) -> io::Result<[u8; 6]> {
     let iface = Interface::try_from_name(name).map_err(|e| io::Error::other(e.to_string()))?;
 
     if let Some((ip, prefix_len)) = addr {
@@ -76,6 +80,12 @@ pub fn configure_interface(name: &str, addr: Option<(IpAddr, u8)>) -> io::Result
         };
         iface
             .add_address(net)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
+
+    if let Some(mtu) = mtu {
+        iface
+            .set_mtu(mtu as u32)
             .map_err(|e| io::Error::other(e.to_string()))?;
     }
 

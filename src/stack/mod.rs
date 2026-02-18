@@ -49,7 +49,7 @@ const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 ///
 /// This limits how many UDP packets can be queued at once. Each slot holds
 /// metadata (source/dest addresses) for one packet.
-const UDP_PACKET_METADATA_SLOTS: usize = 16;
+const UDP_PACKET_METADATA_SLOTS: usize = 128;
 
 /// Starting port number for ephemeral port allocation.
 ///

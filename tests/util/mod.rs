@@ -147,6 +147,39 @@ pub fn test_config() -> TapConfig {
         .local_addr(LOCAL_IP, PREFIX_LEN)
 }
 
+// Dual-tunnel addressing: Alice and Bob on different subnets
+pub const ALICE_PEER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+pub const ALICE_LOCAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+pub const BOB_PEER_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+pub const BOB_LOCAL_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2));
+
+/// Create a network namespace with IP forwarding enabled.
+/// This allows packets to be routed between two TAP interfaces.
+pub fn forwarding_ns() -> std::io::Result<UserNetNamespace> {
+    let script = r#"
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo READY
+while true; do sleep 3600; done
+"#;
+    UserNetNamespace::new(script)
+}
+
+/// Create TapConfig for Alice (tap0, 10.0.0.x subnet)
+pub fn alice_config() -> TapConfig {
+    TapConfig::new()
+        .interface_name("tap0")
+        .peer_addr(ALICE_PEER_IP, PREFIX_LEN)
+        .local_addr(ALICE_LOCAL_IP, PREFIX_LEN)
+}
+
+/// Create TapConfig for Bob (tap1, 10.0.1.x subnet)
+pub fn bob_config() -> TapConfig {
+    TapConfig::new()
+        .interface_name("tap1")
+        .peer_addr(BOB_PEER_IP, PREFIX_LEN)
+        .local_addr(BOB_LOCAL_IP, PREFIX_LEN)
+}
+
 static INIT: Once = Once::new();
 
 pub fn init_logging() {

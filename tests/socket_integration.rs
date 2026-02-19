@@ -2019,6 +2019,385 @@ async fn test_custom_mtu_small_tcp() {
     assert_eq!(&received[..], &data[..]);
 }
 
+// ============================================================================
+// UDP Burst Tests
+// ============================================================================
+
+/// Test sending 50 UDP packets in a burst with ARP pre-warmed.
+/// This verifies the stack can handle rapid-fire UDP sends.
+#[tokio::test]
+async fn test_udp_burst_50_packets_warm() {
+    init_logging();
+
+    let ns_proc = udp_echo_server_ns(15050).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let local_bind: SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
+    let socket = tunnel
+        .udp_bind(local_bind)
+        .await
+        .expect("failed to udp_bind");
+
+    let server_addr: SocketAddr = format!("{}:15050", PEER_IP).parse().unwrap();
+
+    // Warm up ARP by sending one packet and waiting for the echo
+    socket
+        .send_to(b"warmup", server_addr)
+        .await
+        .expect("warmup send failed");
+    let mut buf = [0u8; 256];
+    let (_n, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+        .await
+        .expect("warmup recv timed out")
+        .expect("warmup recv failed");
+
+    let num_packets: usize = 50;
+
+    // Send all packets in a burst
+    for i in 0..num_packets {
+        let msg = format!("pkt{:04}", i);
+        socket
+            .send_to(msg.as_bytes(), server_addr)
+            .await
+            .expect("send_to failed");
+    }
+
+    // Count received echo responses
+    let mut received = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let mut recv_buf = [0u8; 256];
+        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf)).await {
+            Ok(Ok((_n, _from))) => {
+                received += 1;
+                if received >= num_packets {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("recv_from error: {}", e),
+            Err(_) => break, // timeout
+        }
+    }
+
+    assert_eq!(
+        received, num_packets,
+        "should receive all {} packets, only got {}",
+        num_packets, received
+    );
+}
+
+/// Test sending 50 UDP packets in a burst WITHOUT warming ARP first.
+/// This is the harder case: the first send triggers ARP resolution while
+/// packets continue to queue up.
+#[tokio::test]
+async fn test_udp_burst_50_packets_cold() {
+    init_logging();
+
+    let ns_proc = udp_echo_server_ns(15051).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let local_bind: SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
+    let socket = tunnel
+        .udp_bind(local_bind)
+        .await
+        .expect("failed to udp_bind");
+
+    let server_addr: SocketAddr = format!("{}:15051", PEER_IP).parse().unwrap();
+    let num_packets: usize = 50;
+
+    // Send all packets in a burst — NO ARP warmup
+    for i in 0..num_packets {
+        let msg = format!("pkt{:04}", i);
+        socket
+            .send_to(msg.as_bytes(), server_addr)
+            .await
+            .expect("send_to failed");
+    }
+
+    // Count received echo responses
+    let mut received = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let mut recv_buf = [0u8; 256];
+        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf)).await {
+            Ok(Ok((_n, _from))) => {
+                received += 1;
+                if received >= num_packets {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("recv_from error: {}", e),
+            Err(_) => break, // timeout
+        }
+    }
+
+    assert_eq!(
+        received, num_packets,
+        "should receive all {} packets (cold ARP), only got {}",
+        num_packets, received
+    );
+}
+
+/// Test sending 50 UDP packets in a burst under simulated CPU load.
+/// Spawns background tokio tasks to compete for runtime resources.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_udp_burst_50_packets_under_load() {
+    init_logging();
+
+    let ns_proc = udp_echo_server_ns(15052).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    let local_bind: SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
+    let socket = tunnel
+        .udp_bind(local_bind)
+        .await
+        .expect("failed to udp_bind");
+
+    let server_addr: SocketAddr = format!("{}:15052", PEER_IP).parse().unwrap();
+
+    // Warm up ARP
+    socket
+        .send_to(b"warmup", server_addr)
+        .await
+        .expect("warmup send failed");
+    let mut buf = [0u8; 256];
+    let _ = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+        .await
+        .expect("warmup timed out")
+        .expect("warmup failed");
+
+    // Spawn CPU-heavy background tasks to simulate load
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut load_handles = vec![];
+    for _ in 0..4 {
+        let stop = stop.clone();
+        load_handles.push(tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // Busy work that yields occasionally
+                let mut x: u64 = 0;
+                for _ in 0..10000 {
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+                std::hint::black_box(x);
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    let num_packets: usize = 50;
+
+    // Send all packets in a burst
+    for i in 0..num_packets {
+        let msg = format!("pkt{:04}", i);
+        socket
+            .send_to(msg.as_bytes(), server_addr)
+            .await
+            .expect("send_to failed");
+    }
+
+    // Count received echo responses
+    let mut received = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let mut recv_buf = [0u8; 256];
+        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf)).await {
+            Ok(Ok((_n, _from))) => {
+                received += 1;
+                if received >= num_packets {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("recv_from error: {}", e),
+            Err(_) => break,
+        }
+    }
+
+    // Stop load tasks
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for h in load_handles {
+        let _ = h.await;
+    }
+
+    assert_eq!(
+        received, num_packets,
+        "should receive all {} packets under load, only got {}",
+        num_packets, received
+    );
+}
+
+// ============================================================================
+// Dual-Tunnel Tests (Alice ↔ Bob through forwarding namespace)
+// ============================================================================
+
+/// Test sending 50 UDP packets between two tunnels in a shared namespace.
+/// This mirrors the SRTP media session scenario where Alice and Bob each
+/// have their own tunnel connection.
+#[tokio::test]
+async fn test_dual_tunnel_udp_burst_50() {
+    init_logging();
+
+    let ns = forwarding_ns().expect("failed to create forwarding namespace");
+    let pid = ns.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let alice_tunnel = Tunnel::connect_with_config(pid, alice_config())
+        .await
+        .expect("failed to connect Alice tunnel");
+
+    let bob_tunnel = Tunnel::connect_with_config(pid, bob_config())
+        .await
+        .expect("failed to connect Bob tunnel");
+
+    // Bind UDP sockets
+    let alice_bind: SocketAddr = format!("{}:0", ALICE_LOCAL_IP).parse().unwrap();
+    let alice_socket = alice_tunnel
+        .udp_bind(alice_bind)
+        .await
+        .expect("Alice udp_bind failed");
+
+    let bob_bind: SocketAddr = format!("{}:5000", BOB_LOCAL_IP).parse().unwrap();
+    let bob_socket = bob_tunnel
+        .udp_bind(bob_bind)
+        .await
+        .expect("Bob udp_bind failed");
+
+    let bob_addr: SocketAddr = format!("{}:5000", BOB_LOCAL_IP).parse().unwrap();
+    let num_packets: usize = 50;
+
+    // Warm up ARP on Alice's side by sending one packet
+    alice_socket
+        .send_to(b"warmup", bob_addr)
+        .await
+        .expect("warmup send failed");
+    let mut buf = [0u8; 256];
+    let _ = tokio::time::timeout(Duration::from_secs(5), bob_socket.recv_from(&mut buf))
+        .await
+        .expect("warmup recv timed out")
+        .expect("warmup recv failed");
+
+    // Send all packets in a burst from Alice to Bob
+    for i in 0..num_packets {
+        let msg = format!("pkt{:04}", i);
+        alice_socket
+            .send_to(msg.as_bytes(), bob_addr)
+            .await
+            .expect("send_to failed");
+    }
+
+    // Count received packets on Bob's side
+    let mut received = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let mut recv_buf = [0u8; 256];
+        match tokio::time::timeout_at(deadline, bob_socket.recv_from(&mut recv_buf)).await {
+            Ok(Ok((_n, _from))) => {
+                received += 1;
+                if received >= num_packets {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("recv_from error: {}", e),
+            Err(_) => break,
+        }
+    }
+
+    assert_eq!(
+        received, num_packets,
+        "Bob should receive all {} packets from Alice, only got {}",
+        num_packets, received
+    );
+}
+
+/// Same as above but without ARP warmup (cold start).
+#[tokio::test]
+async fn test_dual_tunnel_udp_burst_50_cold() {
+    init_logging();
+
+    let ns = forwarding_ns().expect("failed to create forwarding namespace");
+    let pid = ns.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let alice_tunnel = Tunnel::connect_with_config(pid, alice_config())
+        .await
+        .expect("failed to connect Alice tunnel");
+
+    let bob_tunnel = Tunnel::connect_with_config(pid, bob_config())
+        .await
+        .expect("failed to connect Bob tunnel");
+
+    let alice_bind: SocketAddr = format!("{}:0", ALICE_LOCAL_IP).parse().unwrap();
+    let alice_socket = alice_tunnel
+        .udp_bind(alice_bind)
+        .await
+        .expect("Alice udp_bind failed");
+
+    let bob_bind: SocketAddr = format!("{}:5001", BOB_LOCAL_IP).parse().unwrap();
+    let bob_socket = bob_tunnel
+        .udp_bind(bob_bind)
+        .await
+        .expect("Bob udp_bind failed");
+
+    let bob_addr: SocketAddr = format!("{}:5001", BOB_LOCAL_IP).parse().unwrap();
+    let num_packets: usize = 50;
+
+    // Send all packets in a burst — NO ARP warmup
+    for i in 0..num_packets {
+        let msg = format!("pkt{:04}", i);
+        alice_socket
+            .send_to(msg.as_bytes(), bob_addr)
+            .await
+            .expect("send_to failed");
+    }
+
+    // Count received packets
+    let mut received = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let mut recv_buf = [0u8; 256];
+        match tokio::time::timeout_at(deadline, bob_socket.recv_from(&mut recv_buf)).await {
+            Ok(Ok((_n, _from))) => {
+                received += 1;
+                if received >= num_packets {
+                    break;
+                }
+            }
+            Ok(Err(e)) => panic!("recv_from error: {}", e),
+            Err(_) => break,
+        }
+    }
+
+    assert_eq!(
+        received, num_packets,
+        "Bob should receive all {} packets (cold ARP) from Alice, only got {}",
+        num_packets, received
+    );
+}
+
 /// Test that connect_to with a nonexistent socket path fails immediately
 /// (not related to our changes, but validates error path).
 #[tokio::test]

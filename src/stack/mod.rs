@@ -30,7 +30,7 @@ use tokio::sync::oneshot;
 /// This bounds the work done in each async task iteration to avoid blocking
 /// the tokio runtime when many packets are queued. After processing this many
 /// packets, the task yields to allow other tasks to run.
-const INGRESS_BATCH_SIZE: usize = 16;
+const INGRESS_BATCH_SIZE: usize = 64;
 
 /// Size of TCP socket send and receive buffers in bytes.
 ///
@@ -72,7 +72,7 @@ const TCP_CHANNEL_CAPACITY: usize = 8;
 ///
 /// This limits how many packets can be buffered between the socket API
 /// and the stack task.
-const UDP_CHANNEL_CAPACITY: usize = 32;
+const UDP_CHANNEL_CAPACITY: usize = 128;
 
 type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
 

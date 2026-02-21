@@ -325,7 +325,7 @@ pub struct Tunnel {
 
 /// Pending proxy response senders, keyed by request ID.
 type PendingProxyResponses =
-    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<io::Result<()>>>>>;
+    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<protocol::ProxyResponse>>>>;
 
 struct TunnelInner {
     /// Channel to send commands to the stack task
@@ -860,14 +860,10 @@ impl Tunnel {
                         if let Ok(resp) = decode_control::<ProxyResponse>(&payload) {
                             let sender = {
                                 pending_for_reader.lock().ok()
-                                    .and_then(|mut map| map.remove(&resp.id))
+                                    .and_then(|mut map| map.remove(&resp.id()))
                             };
                             if let Some(tx) = sender {
-                                let result = match resp.error {
-                                    None => Ok(()),
-                                    Some(msg) => Err(io::Error::other(msg)),
-                                };
-                                let _ = tx.send(result);
+                                let _ = tx.send(resp);
                             }
                         }
                     }
@@ -1166,32 +1162,64 @@ impl Tunnel {
     /// Use this together with `add_local_ip` when the local IP is outside
     /// the TAP interface's subnet.
     pub async fn add_peer_route(&self, dest: IpAddr, prefix_len: u8) -> io::Result<()> {
-        self.send_proxy_command(protocol::ProxyCommand::AddRoute {
-            id: 0, // filled in by send_proxy_command
-            destination: dest,
-            prefix_len,
-        })
-        .await
+        let resp = self
+            .send_proxy_command(protocol::ProxyCommand::AddRoute {
+                id: 0,
+                destination: dest,
+                prefix_len,
+            })
+            .await?;
+        match resp {
+            protocol::ProxyResponse::Ok { .. } => Ok(()),
+            protocol::ProxyResponse::Error { error, .. } => Err(io::Error::other(error)),
+            _ => Err(io::Error::other("unexpected response")),
+        }
     }
 
     /// Remove a route from the TAP interface in the namespace.
     pub async fn remove_peer_route(&self, dest: IpAddr, prefix_len: u8) -> io::Result<()> {
-        self.send_proxy_command(protocol::ProxyCommand::RemoveRoute {
-            id: 0, // filled in by send_proxy_command
-            destination: dest,
-            prefix_len,
-        })
-        .await
+        let resp = self
+            .send_proxy_command(protocol::ProxyCommand::RemoveRoute {
+                id: 0,
+                destination: dest,
+                prefix_len,
+            })
+            .await?;
+        match resp {
+            protocol::ProxyResponse::Ok { .. } => Ok(()),
+            protocol::ProxyResponse::Error { error, .. } => Err(io::Error::other(error)),
+            _ => Err(io::Error::other("unexpected response")),
+        }
+    }
+
+    /// Get kernel interface statistics from inside the namespace.
+    ///
+    /// Returns a map of interface name to statistics from /proc/net/dev.
+    pub async fn get_iface_stats(
+        &self,
+    ) -> io::Result<HashMap<String, protocol::InterfaceStats>> {
+        let resp = self
+            .send_proxy_command(protocol::ProxyCommand::GetIfaceStats { id: 0 })
+            .await?;
+        match resp {
+            protocol::ProxyResponse::IfaceStats { interfaces, .. } => Ok(interfaces),
+            protocol::ProxyResponse::Error { error, .. } => Err(io::Error::other(error)),
+            _ => Err(io::Error::other("unexpected response")),
+        }
     }
 
     /// Send a command to the proxy and wait for the response.
-    async fn send_proxy_command(&self, mut cmd: protocol::ProxyCommand) -> io::Result<()> {
+    async fn send_proxy_command(
+        &self,
+        mut cmd: protocol::ProxyCommand,
+    ) -> io::Result<protocol::ProxyResponse> {
         let id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
 
         // Set the ID on the command
         match &mut cmd {
             protocol::ProxyCommand::AddRoute { id: cid, .. } => *cid = id,
             protocol::ProxyCommand::RemoveRoute { id: cid, .. } => *cid = id,
+            protocol::ProxyCommand::GetIfaceStats { id: cid } => *cid = id,
         }
 
         // Register a oneshot for the response
@@ -1214,7 +1242,7 @@ impl Tunnel {
             .map_err(|_| broken_pipe("IPC writer gone"))?;
 
         // Wait for response
-        rx.await.map_err(|_| broken_pipe("proxy response lost"))?
+        rx.await.map_err(|_| broken_pipe("proxy response lost"))
     }
 
     /// Explicitly close the tunnel, killing the proxy child process.

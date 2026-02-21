@@ -5,6 +5,7 @@
 //! - 0x01: Ethernet frame (raw bytes)
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -44,6 +45,19 @@ fn default_mtu() -> u16 {
     1500
 }
 
+/// Per-interface kernel statistics from /proc/net/dev.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceStats {
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
+}
+
 /// Command sent from the library to the proxy over the control channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd")]
@@ -60,15 +74,39 @@ pub enum ProxyCommand {
         destination: IpAddr,
         prefix_len: u8,
     },
+    /// Get kernel interface statistics from /proc/net/dev.
+    GetIfaceStats { id: u64 },
 }
 
 /// Response from the proxy to a command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyResponse {
-    /// Request ID matching the command.
-    pub id: u64,
-    /// Error message, if the command failed.
-    pub error: Option<String>,
+#[serde(tag = "status")]
+pub enum ProxyResponse {
+    Ok { id: u64 },
+    Error { id: u64, error: String },
+    IfaceStats {
+        id: u64,
+        interfaces: HashMap<String, InterfaceStats>,
+    },
+}
+
+impl ProxyResponse {
+    /// Get the request ID from any response variant.
+    pub fn id(&self) -> u64 {
+        match self {
+            Self::Ok { id, .. } | Self::Error { id, .. } | Self::IfaceStats { id, .. } => *id,
+        }
+    }
+
+    /// Create a success response.
+    pub fn ok(id: u64) -> Self {
+        Self::Ok { id }
+    }
+
+    /// Create an error response.
+    pub fn error(id: u64, msg: String) -> Self {
+        Self::Error { id, error: msg }
+    }
 }
 
 /// Decoded message from the wire.

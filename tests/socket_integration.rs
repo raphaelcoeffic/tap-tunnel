@@ -2398,6 +2398,65 @@ async fn test_dual_tunnel_udp_burst_50_cold() {
     );
 }
 
+/// Test that get_iface_stats returns kernel interface statistics from inside the namespace.
+#[tokio::test]
+async fn test_get_iface_stats() {
+    init_logging();
+
+    let ns_proc = udp_echo_server_ns(19800).expect("failed to create namespace");
+    let pid = ns_proc.pid();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let tunnel = Tunnel::connect_with_config(pid, test_config())
+        .await
+        .expect("failed to connect to namespace");
+
+    // Send some UDP traffic to generate interface stats
+    let sock = tunnel
+        .udp_bind("0.0.0.0:0".parse().unwrap())
+        .await
+        .expect("failed to bind UDP");
+
+    let server_addr: SocketAddr = format!("{}:19800", PEER_IP).parse().unwrap();
+    sock.send_to(b"ping", server_addr)
+        .await
+        .expect("send failed");
+
+    let mut buf = [0u8; 64];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+        .await
+        .expect("timeout waiting for response")
+        .expect("recv_from failed");
+    assert!(n > 0, "should receive a response");
+
+    // Now query the interface stats
+    let stats = tunnel
+        .get_iface_stats()
+        .await
+        .expect("failed to get interface stats");
+
+    // Should have at least the loopback and tap0 interfaces
+    assert!(
+        stats.contains_key("lo"),
+        "stats should contain loopback interface, got: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        stats.contains_key("tap0"),
+        "stats should contain tap0 interface, got: {:?}",
+        stats.keys().collect::<Vec<_>>()
+    );
+
+    // tap0 should have non-zero traffic from our UDP exchange
+    let tap_stats = &stats["tap0"];
+    assert!(
+        tap_stats.rx_packets > 0 || tap_stats.tx_packets > 0,
+        "tap0 should have some traffic, got: {:?}",
+        tap_stats
+    );
+}
+
 /// Test that connect_to with a nonexistent socket path fails immediately
 /// (not related to our changes, but validates error path).
 #[tokio::test]

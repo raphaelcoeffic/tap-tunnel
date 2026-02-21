@@ -34,9 +34,10 @@ use ipc::{accept_stream, create_stream_listener};
 use namespace::join_namespace;
 use tap::{configure_interface, create_tap};
 use tap_tunnel::TapConfig;
+use std::collections::HashMap;
 use tap_tunnel::protocol::{
-    ClientHello, Message, ProxyCommand, ProxyConfig, ProxyResponse, decode_control, decode_message,
-    encode_control, encode_frame,
+    ClientHello, InterfaceStats, Message, ProxyCommand, ProxyConfig, ProxyResponse,
+    decode_control, decode_message, encode_control, encode_frame,
 };
 
 /// Ethernet header size in bytes.
@@ -512,17 +513,14 @@ async fn handle_proxy_command(
                     "[PROXY] added route {}/{} dev {}",
                     destination, prefix_len, iface_name
                 );
-                ProxyResponse { id, error: None }
+                ProxyResponse::ok(id)
             }
             Err(e) => {
                 error!(
                     "[PROXY] failed to add route {}/{}: {}",
                     destination, prefix_len, e
                 );
-                ProxyResponse {
-                    id,
-                    error: Some(e.to_string()),
-                }
+                ProxyResponse::error(id, e.to_string())
             }
         },
         ProxyCommand::RemoveRoute {
@@ -535,20 +533,53 @@ async fn handle_proxy_command(
                     "[PROXY] removed route {}/{} dev {}",
                     destination, prefix_len, iface_name
                 );
-                ProxyResponse { id, error: None }
+                ProxyResponse::ok(id)
             }
             Err(e) => {
                 error!(
                     "[PROXY] failed to remove route {}/{}: {}",
                     destination, prefix_len, e
                 );
-                ProxyResponse {
-                    id,
-                    error: Some(e.to_string()),
-                }
+                ProxyResponse::error(id, e.to_string())
+            }
+        },
+        ProxyCommand::GetIfaceStats { id } => match read_proc_net_dev() {
+            Ok(interfaces) => {
+                debug!("[PROXY] returning interface stats ({} interfaces)", interfaces.len());
+                ProxyResponse::IfaceStats { id, interfaces }
+            }
+            Err(e) => {
+                error!("[PROXY] failed to read /proc/net/dev: {}", e);
+                ProxyResponse::error(id, e.to_string())
             }
         },
     }
+}
+
+/// Parse /proc/net/dev and return per-interface statistics.
+fn read_proc_net_dev() -> io::Result<HashMap<String, InterfaceStats>> {
+    let content = std::fs::read_to_string("/proc/net/dev")?;
+    let mut stats = HashMap::new();
+    for line in content.lines().skip(2) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 13 {
+            let iface = parts[0].trim_end_matches(':').to_string();
+            stats.insert(
+                iface,
+                InterfaceStats {
+                    rx_bytes: parts[1].parse().unwrap_or(0),
+                    rx_packets: parts[2].parse().unwrap_or(0),
+                    rx_errors: parts[3].parse().unwrap_or(0),
+                    rx_dropped: parts[4].parse().unwrap_or(0),
+                    tx_bytes: parts[9].parse().unwrap_or(0),
+                    tx_packets: parts[10].parse().unwrap_or(0),
+                    tx_errors: parts[11].parse().unwrap_or(0),
+                    tx_dropped: parts[12].parse().unwrap_or(0),
+                },
+            );
+        }
+    }
+    Ok(stats)
 }
 
 /// Duplicate an OwnedFd via dup().

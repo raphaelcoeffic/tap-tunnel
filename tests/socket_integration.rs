@@ -1513,7 +1513,7 @@ async fn test_tcp_split_async_traits() {
 async fn test_handshake_timeout_no_response() {
     init_logging();
 
-    // Create a SEQPACKET listener that accepts connections but never responds
+    // Create a STREAM listener that accepts connections but never responds
     let socket_path = format!("/tmp/tap-tunnel-test-timeout-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
@@ -1521,7 +1521,7 @@ async fn test_handshake_timeout_no_response() {
     let path_clone = socket_path.clone();
     let listener_handle = std::thread::spawn(move || {
         unsafe {
-            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
             assert!(fd >= 0, "socket() failed");
 
             let mut addr: libc::sockaddr_un = std::mem::zeroed();

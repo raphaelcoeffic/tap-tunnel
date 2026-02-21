@@ -5,7 +5,7 @@
 //! - 0x01: Ethernet frame (raw bytes)
 
 use serde::{Deserialize, Serialize};
-use std::io;
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Message type byte for control messages.
@@ -120,6 +120,33 @@ pub fn decode_message(data: &[u8]) -> io::Result<Message> {
             format!("unknown message type: 0x{:02x}", msg_type),
         )),
     }
+}
+
+/// Write a length-prefixed message (blocking I/O).
+///
+/// Wire format: `[4-byte big-endian length][message bytes]`
+pub fn write_framed_sync(writer: &mut impl Write, msg: &[u8]) -> io::Result<()> {
+    let len = (msg.len() as u32).to_be_bytes();
+    writer.write_all(&len)?;
+    writer.write_all(msg)?;
+    Ok(())
+}
+
+/// Read a length-prefixed message (blocking I/O).
+///
+/// Returns the number of bytes read into `buf`.
+pub fn read_framed_sync(reader: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<usize> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "zero-length frame"));
+    }
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    reader.read_exact(&mut buf[..len])?;
+    Ok(len)
 }
 
 /// Compute the default client IP from the TAP IP (tap_ip + 1).

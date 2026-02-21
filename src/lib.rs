@@ -67,6 +67,7 @@ use smoltcp::phy::FaultInjector;
 use socket::{TcpListener, TcpStream, UdpSocket};
 use stack::{ProxyDevice, StackCommand, StackConfig};
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -76,6 +77,95 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
+
+/// Counters for diagnosing data path bottlenecks.
+///
+/// Tracks frames/packets at every point where data can be dropped.
+#[derive(Debug, Default)]
+pub struct TunnelStats {
+    // IPC reader: proxy → stack
+    /// Frames received from proxy via IPC
+    pub ipc_rx_frames: AtomicU64,
+    /// Frames dropped by IPC reader (channel full)
+    pub ipc_rx_dropped: AtomicU64,
+
+    // IPC writer: stack → proxy
+    /// Frames sent to proxy via IPC
+    pub ipc_tx_frames: AtomicU64,
+    /// Frames dropped by IPC writer (write error)
+    pub ipc_tx_errors: AtomicU64,
+
+    // ProxyDevice (smoltcp device)
+    /// Frames received from channel by smoltcp device
+    pub device_rx_frames: AtomicU64,
+    /// Frames transmitted by smoltcp device
+    pub device_tx_frames: AtomicU64,
+    /// Frames dropped by smoltcp device (channel full)
+    pub device_tx_dropped: AtomicU64,
+
+    // Stack UDP path
+    /// UDP packets sent from app to smoltcp (send_slice calls)
+    pub udp_tx_packets: AtomicU64,
+    /// UDP packets that smoltcp rejected (send_slice error)
+    pub udp_tx_failed: AtomicU64,
+    /// UDP packets delivered from smoltcp to app (recv_slice calls)
+    pub udp_rx_packets: AtomicU64,
+    /// UDP packets dropped (app channel full)
+    pub udp_rx_dropped: AtomicU64,
+}
+
+impl TunnelStats {
+    /// Create a new stats instance wrapped in Arc for sharing.
+    pub fn new_shared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Get a snapshot of all counters.
+    pub fn snapshot(&self) -> TunnelStatsSnapshot {
+        TunnelStatsSnapshot {
+            ipc_rx_frames: self.ipc_rx_frames.load(Ordering::Relaxed),
+            ipc_rx_dropped: self.ipc_rx_dropped.load(Ordering::Relaxed),
+            ipc_tx_frames: self.ipc_tx_frames.load(Ordering::Relaxed),
+            ipc_tx_errors: self.ipc_tx_errors.load(Ordering::Relaxed),
+            device_rx_frames: self.device_rx_frames.load(Ordering::Relaxed),
+            device_tx_frames: self.device_tx_frames.load(Ordering::Relaxed),
+            device_tx_dropped: self.device_tx_dropped.load(Ordering::Relaxed),
+            udp_tx_packets: self.udp_tx_packets.load(Ordering::Relaxed),
+            udp_tx_failed: self.udp_tx_failed.load(Ordering::Relaxed),
+            udp_rx_packets: self.udp_rx_packets.load(Ordering::Relaxed),
+            udp_rx_dropped: self.udp_rx_dropped.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time snapshot of tunnel statistics.
+#[derive(Debug, Clone)]
+pub struct TunnelStatsSnapshot {
+    pub ipc_rx_frames: u64,
+    pub ipc_rx_dropped: u64,
+    pub ipc_tx_frames: u64,
+    pub ipc_tx_errors: u64,
+    pub device_rx_frames: u64,
+    pub device_tx_frames: u64,
+    pub device_tx_dropped: u64,
+    pub udp_tx_packets: u64,
+    pub udp_tx_failed: u64,
+    pub udp_rx_packets: u64,
+    pub udp_rx_dropped: u64,
+}
+
+impl fmt::Display for TunnelStatsSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "IPC:    rx={} rx_drop={} tx={} tx_err={}",
+            self.ipc_rx_frames, self.ipc_rx_dropped,
+            self.ipc_tx_frames, self.ipc_tx_errors)?;
+        writeln!(f, "Device: rx={} tx={} tx_drop={}",
+            self.device_rx_frames, self.device_tx_frames, self.device_tx_dropped)?;
+        write!(f, "UDP:    tx={} tx_fail={} rx={} rx_drop={}",
+            self.udp_tx_packets, self.udp_tx_failed,
+            self.udp_rx_packets, self.udp_rx_dropped)
+    }
+}
 
 pub use socket::{
     OwnedReadHalf, OwnedWriteHalf, TcpListener as TunnelTcpListener, TcpStream as TunnelTcpStream,
@@ -90,7 +180,7 @@ const COMMAND_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of the frame channels between IPC tasks and stack task.
 ///
 /// This limits how many Ethernet frames can be buffered in each direction.
-const FRAME_CHANNEL_CAPACITY: usize = 256;
+const FRAME_CHANNEL_CAPACITY: usize = 2048;
 
 /// Default IP-level MTU (Maximum Transmission Unit).
 const DEFAULT_MTU: u16 = 1500;
@@ -254,6 +344,8 @@ struct TunnelInner {
     next_request_id: AtomicU64,
     /// Map of pending proxy command responses
     pending_proxy_responses: PendingProxyResponses,
+    /// Data path statistics
+    stats: Arc<TunnelStats>,
 }
 
 impl TunnelInner {
@@ -453,11 +545,11 @@ impl Tunnel {
     pub fn connect_with_config_blocking(pid: u32, mut config: TapConfig) -> io::Result<Self> {
         use protocol::{
             ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
-            encode_control,
+            encode_control, write_framed_sync,
         };
-        use std::io::{Read, Write};
+        use std::io::Read;
 
-        // Create socketpair for frame relay (SEQPACKET for message boundaries)
+        // Create socketpair for frame relay (STREAM with length-prefix framing)
         let (parent_fd, child_fd) = ipc::create_socketpair()?;
 
         // Spawn the proxy process
@@ -466,18 +558,21 @@ impl Tunnel {
         // Convert to UnixStream for handshake
         let mut stream = fd_to_unix_stream(parent_fd)?;
 
-        // Send ClientHello (now empty - client manages its own IPs)
+        // Send ClientHello with length-prefix framing
         let hello = ClientHello::default();
         let hello_msg = encode_control(&hello)?;
-        stream.write_all(&hello_msg)?;
+        write_framed_sync(&mut stream, &hello_msg)?;
         debug!("sent ClientHello: {:?}", hello);
 
-        // Receive ProxyConfig with timeout and child-exit monitoring
-        let mut buf = [0u8; 1024];
+        // Receive ProxyConfig with timeout and child-exit monitoring (length-prefix framed)
         stream.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let n = loop {
-            match stream.read(&mut buf) {
+
+        // Read the 4-byte length prefix with timeout/retry
+        let mut len_buf = [0u8; 4];
+        let mut len_offset = 0;
+        loop {
+            match stream.read(&mut len_buf[len_offset..]) {
                 Ok(0) => {
                     let stderr = read_child_stderr(&mut proxy_child);
                     let msg = if stderr.is_empty() {
@@ -487,7 +582,12 @@ impl Tunnel {
                     };
                     return Err(unexpected_eof(&msg));
                 }
-                Ok(n) => break n,
+                Ok(n) => {
+                    len_offset += n;
+                    if len_offset >= 4 {
+                        break;
+                    }
+                }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut =>
@@ -510,11 +610,15 @@ impl Tunnel {
                 }
                 Err(e) => return Err(e),
             }
-        };
-        // Restore blocking mode for IPC after handshake
-        stream.set_read_timeout(None)?;
+        }
 
-        let msg = decode_message(&buf[..n])?;
+        // Read the message body (blocking is fine now, we know data is coming)
+        stream.set_read_timeout(None)?;
+        let msg_len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; msg_len];
+        std::io::Read::read_exact(&mut stream, &mut buf)?;
+
+        let msg = decode_message(&buf)?;
         let proxy_config: ProxyConfig = match msg {
             Message::Control(payload) => decode_control(&payload)?,
             Message::Frame(_) => {
@@ -588,32 +692,28 @@ impl Tunnel {
     ) -> io::Result<Self> {
         use protocol::{
             ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
-            encode_control,
+            encode_control, read_framed_sync, write_framed_sync,
         };
-        use std::io::{Read, Write};
 
         let socket_path = socket_path.as_ref();
 
         // Connect to the proxy's listening socket
-        let frame_fd = ipc::connect_seqpacket(socket_path)?;
+        let frame_fd = ipc::connect_stream(socket_path)?;
         debug!("connected to proxy at {:?}", socket_path);
 
         // Convert to UnixStream for handshake
         let mut stream = fd_to_unix_stream(frame_fd)?;
 
-        // Send ClientHello (empty - client manages its own IPs)
+        // Send ClientHello with length-prefix framing
         let hello = ClientHello::default();
         let hello_msg = encode_control(&hello)?;
-        stream.write_all(&hello_msg)?;
+        write_framed_sync(&mut stream, &hello_msg)?;
         debug!("sent ClientHello: {:?}", hello);
 
-        // Receive ProxyConfig with timeout
-        let mut buf = [0u8; 1024];
+        // Receive ProxyConfig with length-prefix framing
         stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Err(unexpected_eof("proxy closed connection during handshake"));
-        }
+        let mut buf = vec![0u8; 1024];
+        let n = read_framed_sync(&mut stream, &mut buf)?;
         stream.set_read_timeout(None)?;
 
         let msg = decode_message(&buf[..n])?;
@@ -659,6 +759,12 @@ impl Tunnel {
         // Control channel for sending proxy commands (route add/remove)
         let (control_tx, mut control_rx) = mpsc::channel::<Vec<u8>>(32);
 
+        // Data path statistics
+        let stats = TunnelStats::new_shared();
+        let stats_ipc_reader = Arc::clone(&stats);
+        let stats_ipc_writer = Arc::clone(&stats);
+        let stats_stack = Arc::clone(&stats);
+
         // Pending proxy responses (shared between API methods and IPC reader)
         let pending_proxy_responses: PendingProxyResponses =
             Arc::new(Mutex::new(HashMap::new()));
@@ -688,112 +794,169 @@ impl Tunnel {
             gateway: gateway_ip,
         };
 
-        let frame_read_stream = frame_stream.try_clone()?;
-        let frame_write_stream = frame_stream;
+        // Use STREAM socket with into_split() for truly concurrent read/write.
+        frame_stream.set_nonblocking(true)?;
+        let ipc_stream = tokio::net::UnixStream::from_std(frame_stream)?;
+        let (ipc_read_half, ipc_write_half) = ipc_stream.into_split();
 
-        // Set non-blocking and convert to tokio
-        frame_read_stream.set_nonblocking(true)?;
-        frame_write_stream.set_nonblocking(true)?;
-
-        let mut ipc_read_stream = tokio::net::UnixStream::from_std(frame_read_stream)?;
-        let mut ipc_write_stream = tokio::net::UnixStream::from_std(frame_write_stream)?;
+        // Wrap in BufReader/BufWriter for batched I/O (reduces syscalls dramatically)
+        const LIB_IPC_BUFFER_SIZE: usize = 256 * 1024;
 
         // Shared flag: set by IPC tasks when proxy connection is lost
         let ipc_dead = Arc::new(AtomicBool::new(false));
         let ipc_dead_reader = Arc::clone(&ipc_dead);
         let ipc_dead_writer = Arc::clone(&ipc_dead);
 
-        // Compute buffer sizes from configured MTU
-        let ipc_buffer_size = config.mtu as usize + 100;
-
-        // Spawn IPC reader task (proxy -> stack)
+        // Spawn IPC reader task (proxy -> stack) with length-prefix framing
         tokio::spawn(async move {
             use protocol::{Message, ProxyResponse, decode_control, decode_message};
             use tokio::io::AsyncReadExt;
 
-            debug!("[IPC-RX] reader task starting");
-            let mut buf = vec![0u8; ipc_buffer_size];
+            debug!("[IPC-RX] reader task starting (stream mode)");
+            let mut reader = tokio::io::BufReader::with_capacity(LIB_IPC_BUFFER_SIZE, ipc_read_half);
+            let mut len_buf = [0u8; 4];
+            let mut msg_buf = vec![0u8; 2048];
             loop {
-                match ipc_read_stream.read(&mut buf).await {
-                    Ok(0) => {
+                // Read length prefix
+                match reader.read_exact(&mut len_buf).await {
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                         debug!("[IPC-RX] proxy closed connection");
                         ipc_dead_reader.store(true, Ordering::Relaxed);
                         break;
                     }
-                    Ok(n) => match decode_message(&buf[..n]) {
-                        Ok(Message::Frame(frame)) => {
-                            if frame_tx.send(frame).await.is_err() {
-                                // Stack dropped first - clean shutdown, don't set ipc_dead
-                                break;
-                            }
-                        }
-                        Ok(Message::Control(payload)) => {
-                            // Try to decode as ProxyResponse and route to waiting caller
-                            if let Ok(resp) = decode_control::<ProxyResponse>(&payload) {
-                                let sender = {
-                                    pending_for_reader.lock().ok()
-                                        .and_then(|mut map| map.remove(&resp.id))
-                                };
-                                if let Some(tx) = sender {
-                                    let result = match resp.error {
-                                        None => Ok(()),
-                                        Some(msg) => Err(io::Error::other(msg)),
-                                    };
-                                    let _ = tx.send(result);
-                                }
-                            }
-                        }
-                        Err(_) => {} // Ignore decode errors
-                    },
                     Err(e) => {
                         debug!("[IPC-RX] read error: {}", e);
                         ipc_dead_reader.store(true, Ordering::Relaxed);
                         break;
                     }
                 }
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
+                if msg_len > msg_buf.len() {
+                    msg_buf.resize(msg_len, 0);
+                }
+
+                // Read message body
+                if let Err(e) = reader.read_exact(&mut msg_buf[..msg_len]).await {
+                    debug!("[IPC-RX] read error during body: {}", e);
+                    ipc_dead_reader.store(true, Ordering::Relaxed);
+                    break;
+                }
+
+                match decode_message(&msg_buf[..msg_len]) {
+                    Ok(Message::Frame(frame)) => {
+                        stats_ipc_reader.ipc_rx_frames.fetch_add(1, Ordering::Relaxed);
+                        match frame_tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                stats_ipc_reader.ipc_rx_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Message::Control(payload)) => {
+                        if let Ok(resp) = decode_control::<ProxyResponse>(&payload) {
+                            let sender = {
+                                pending_for_reader.lock().ok()
+                                    .and_then(|mut map| map.remove(&resp.id))
+                            };
+                            if let Some(tx) = sender {
+                                let result = match resp.error {
+                                    None => Ok(()),
+                                    Some(msg) => Err(io::Error::other(msg)),
+                                };
+                                let _ = tx.send(result);
+                            }
+                        }
+                    }
+                    Err(_) => {} // Ignore decode errors
+                }
             }
         });
 
-        // Spawn IPC writer task (stack -> proxy, and control messages -> proxy)
+        // Spawn IPC writer task (stack -> proxy) with batched length-prefix framing
         tokio::spawn(async move {
             use protocol::encode_frame;
             use tokio::io::AsyncWriteExt;
 
-            debug!("[IPC-TX] writer task starting");
+            debug!("[IPC-TX] writer task starting (stream mode)");
+            let mut writer = tokio::io::BufWriter::with_capacity(LIB_IPC_BUFFER_SIZE, ipc_write_half);
             loop {
+                // Wait for the first frame or control message
                 tokio::select! {
                     frame = frame_to_proxy_rx.recv() => {
                         match frame {
                             Some(frame) => {
                                 let msg = encode_frame(&frame);
-                                if ipc_write_stream.write_all(&msg).await.is_err() {
+                                let len = (msg.len() as u32).to_be_bytes();
+                                if writer.write_all(&len).await.is_err()
+                                    || writer.write_all(&msg).await.is_err()
+                                {
                                     debug!("[IPC-TX] write error, proxy connection lost");
+                                    stats_ipc_writer.ipc_tx_errors.fetch_add(1, Ordering::Relaxed);
                                     ipc_dead_writer.store(true, Ordering::Relaxed);
                                     break;
                                 }
+                                stats_ipc_writer.ipc_tx_frames.fetch_add(1, Ordering::Relaxed);
                             }
-                            None => break, // clean shutdown
+                            None => break,
                         }
                     }
                     ctrl = control_rx.recv() => {
                         match ctrl {
                             Some(msg) => {
-                                if ipc_write_stream.write_all(&msg).await.is_err() {
+                                let len = (msg.len() as u32).to_be_bytes();
+                                if writer.write_all(&len).await.is_err()
+                                    || writer.write_all(&msg).await.is_err()
+                                {
                                     debug!("[IPC-TX] write error on control, proxy connection lost");
                                     ipc_dead_writer.store(true, Ordering::Relaxed);
                                     break;
                                 }
                             }
-                            None => break, // clean shutdown
+                            None => break,
                         }
                     }
+                }
+
+                // Drain additional buffered frames (non-blocking) for batching
+                while let Ok(frame) = frame_to_proxy_rx.try_recv() {
+                    let msg = encode_frame(&frame);
+                    let len = (msg.len() as u32).to_be_bytes();
+                    if writer.write_all(&len).await.is_err()
+                        || writer.write_all(&msg).await.is_err()
+                    {
+                        stats_ipc_writer.ipc_tx_errors.fetch_add(1, Ordering::Relaxed);
+                        ipc_dead_writer.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    stats_ipc_writer.ipc_tx_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                while let Ok(msg) = control_rx.try_recv() {
+                    let len = (msg.len() as u32).to_be_bytes();
+                    if writer.write_all(&len).await.is_err()
+                        || writer.write_all(&msg).await.is_err()
+                    {
+                        ipc_dead_writer.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+
+                // Flush all accumulated writes as a batch
+                if writer.flush().await.is_err() {
+                    debug!("[IPC-TX] flush error, proxy connection lost");
+                    ipc_dead_writer.store(true, Ordering::Relaxed);
+                    break;
                 }
             }
         });
 
         // Create device for smoltcp
         let ethernet_frame_size = config.mtu as usize + ETHERNET_HEADER_SIZE;
-        let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, ethernet_frame_size);
+        let stats_device = Arc::clone(&stats);
+        let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, ethernet_frame_size, stats_device);
 
         // Spawn stack task (will exit when command channel disconnects or IPC dies).
         // Only wrap with FaultInjector when packet loss is configured, because
@@ -803,12 +966,12 @@ impl Tunnel {
             let mut device = FaultInjector::new(device, random_seed());
             device.set_drop_chance(packet_loss);
             tokio::spawn(async move {
-                stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead).await;
+                stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead, stats_stack).await;
             });
         } else {
             let mut device = device;
             tokio::spawn(async move {
-                stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead).await;
+                stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead, stats_stack).await;
             });
         }
 
@@ -822,6 +985,7 @@ impl Tunnel {
                 closed: AtomicBool::new(false),
                 next_request_id: AtomicU64::new(1),
                 pending_proxy_responses,
+                stats,
             }),
         })
     }
@@ -1069,6 +1233,16 @@ impl Tunnel {
     /// Get the proxy's gateway info (TAP IP and MAC address).
     pub fn gateway(&self) -> (IpAddr, [u8; 6]) {
         self.inner.gateway
+    }
+
+    /// Get a snapshot of data path statistics.
+    pub fn stats(&self) -> TunnelStatsSnapshot {
+        self.inner.stats.snapshot()
+    }
+
+    /// Get a reference to the shared stats for direct access.
+    pub fn stats_shared(&self) -> &Arc<TunnelStats> {
+        &self.inner.stats
     }
 }
 

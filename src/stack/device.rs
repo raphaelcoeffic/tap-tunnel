@@ -6,7 +6,11 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Ipv4Packet,
 };
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc::{Receiver, Sender, error::TryRecvError};
+
+use crate::TunnelStats;
 
 /// Channel for receiving Ethernet frames from the IPC task.
 type FrameReceiver = Receiver<Vec<u8>>;
@@ -22,12 +26,13 @@ pub struct ProxyDevice {
     rx: FrameReceiver,
     tx: FrameSender,
     mtu: usize,
+    stats: Arc<TunnelStats>,
 }
 
 impl ProxyDevice {
-    /// Create a new ProxyDevice with the given channels and MTU.
-    pub fn new(rx: FrameReceiver, tx: FrameSender, mtu: usize) -> Self {
-        Self { rx, tx, mtu }
+    /// Create a new ProxyDevice with the given channels, MTU, and stats.
+    pub fn new(rx: FrameReceiver, tx: FrameSender, mtu: usize, stats: Arc<TunnelStats>) -> Self {
+        Self { rx, tx, mtu, stats }
     }
 }
 
@@ -45,8 +50,9 @@ impl Device for ProxyDevice {
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         match self.rx.try_recv() {
             Ok(frame) => {
+                self.stats.device_rx_frames.fetch_add(1, Ordering::Relaxed);
                 log_frame("RX", &frame);
-                Some((ProxyRxToken { frame }, ProxyTxToken { tx: &self.tx }))
+                Some((ProxyRxToken { frame }, ProxyTxToken { tx: &self.tx, stats: &self.stats }))
             }
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
@@ -57,7 +63,7 @@ impl Device for ProxyDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(ProxyTxToken { tx: &self.tx })
+        Some(ProxyTxToken { tx: &self.tx, stats: &self.stats })
     }
 }
 
@@ -78,6 +84,7 @@ impl RxToken for ProxyRxToken {
 /// TxToken for transmitting a frame to the proxy.
 pub struct ProxyTxToken<'a> {
     tx: &'a FrameSender,
+    stats: &'a Arc<TunnelStats>,
 }
 
 impl<'a> TxToken for ProxyTxToken<'a> {
@@ -92,7 +99,10 @@ impl<'a> TxToken for ProxyTxToken<'a> {
 
         // Best effort send - if channel is full/disconnected, drop the frame
         if let Err(e) = self.tx.try_send(buffer) {
+            self.stats.device_tx_dropped.fetch_add(1, Ordering::Relaxed);
             warn!("failed to send frame to proxy: {:?}", e);
+        } else {
+            self.stats.device_tx_frames.fetch_add(1, Ordering::Relaxed);
         }
         result
     }

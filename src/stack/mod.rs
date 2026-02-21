@@ -7,7 +7,7 @@ mod device;
 
 pub use device::ProxyDevice;
 
-use crate::IpWithPrefix;
+use crate::{IpWithPrefix, TunnelStats};
 use log::{debug, trace, warn};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::Device;
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
-use std::sync::atomic::{self, AtomicBool};
+use std::sync::atomic::{self, AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, Receiver};
@@ -30,7 +30,7 @@ use tokio::sync::oneshot;
 /// This bounds the work done in each async task iteration to avoid blocking
 /// the tokio runtime when many packets are queued. After processing this many
 /// packets, the task yields to allow other tasks to run.
-const INGRESS_BATCH_SIZE: usize = 64;
+const INGRESS_BATCH_SIZE: usize = 256;
 
 /// Size of TCP socket send and receive buffers in bytes.
 ///
@@ -45,11 +45,17 @@ const TCP_SOCKET_BUFFER_SIZE: usize = 65535;
 /// allows buffering many packets.
 const UDP_PACKET_BUFFER_SIZE: usize = 65535;
 
+/// Size of stack buffer for UDP reads.
+///
+/// 9216 bytes covers jumbo frames (9000 MTU) plus headers. Using a stack
+/// buffer avoids a 65KB heap allocation per received packet.
+const UDP_READ_BUF_SIZE: usize = 9216;
+
 /// Number of UDP packet metadata slots.
 ///
 /// This limits how many UDP packets can be queued at once. Each slot holds
 /// metadata (source/dest addresses) for one packet.
-const UDP_PACKET_METADATA_SLOTS: usize = 128;
+const UDP_PACKET_METADATA_SLOTS: usize = 256;
 
 /// Starting port number for ephemeral port allocation.
 ///
@@ -72,7 +78,7 @@ const TCP_CHANNEL_CAPACITY: usize = 8;
 ///
 /// This limits how many packets can be buffered between the socket API
 /// and the stack task.
-const UDP_CHANNEL_CAPACITY: usize = 128;
+const UDP_CHANNEL_CAPACITY: usize = 512;
 
 type ResponseSender<R> = oneshot::Sender<io::Result<R>>;
 
@@ -247,6 +253,7 @@ pub async fn run_stack(
     config: StackConfig,
     mut commands: Receiver<StackCommand>,
     ipc_dead: Arc<AtomicBool>,
+    stats: Arc<TunnelStats>,
 ) {
     debug!("run_stack starting");
 
@@ -348,7 +355,7 @@ pub async fn run_stack(
         }
 
         // Poll write channels for all sockets (app -> smoltcp)
-        poll_write_channels(&mut sockets, &mut tcp_states, &mut udp_states);
+        poll_write_channels(&mut sockets, &mut tcp_states, &mut udp_states, &stats);
 
         // Poll the interface in batches to avoid blocking the runtime
         let timestamp = instant_since(start_timestamp);
@@ -374,7 +381,7 @@ pub async fn run_stack(
         }
 
         // Process read channels for all sockets (smoltcp -> app)
-        poll_read_channels(&mut sockets, &mut tcp_states, &mut udp_states);
+        poll_read_channels(&mut sockets, &mut tcp_states, &mut udp_states, &stats);
 
         // Process pending operations that may now be completable
         if socket_state_changed {
@@ -903,6 +910,7 @@ fn poll_write_channels(
     sockets: &mut SocketSet<'_>,
     tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
     udp_states: &mut HashMap<SocketHandle, UdpSocketState>,
+    stats: &TunnelStats,
 ) {
     // Process TCP write channels
     for (&handle, state) in tcp_states.iter_mut() {
@@ -913,7 +921,7 @@ fn poll_write_channels(
     // Process UDP write channels
     for (&handle, state) in udp_states.iter_mut() {
         let socket = sockets.get_mut::<udp::Socket>(handle);
-        process_udp_write(socket, state);
+        process_udp_write(socket, state, stats);
     }
 }
 
@@ -922,6 +930,7 @@ fn poll_read_channels(
     sockets: &mut SocketSet<'_>,
     tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
     udp_states: &mut HashMap<SocketHandle, UdpSocketState>,
+    stats: &TunnelStats,
 ) {
     // Process TCP read channels
     for (&handle, state) in tcp_states.iter_mut() {
@@ -932,7 +941,7 @@ fn poll_read_channels(
     // Process UDP read channels
     for (&handle, state) in udp_states.iter_mut() {
         let socket = sockets.get_mut::<udp::Socket>(handle);
-        process_udp_read(socket, state);
+        process_udp_read(socket, state, stats);
     }
 }
 
@@ -997,12 +1006,19 @@ fn process_tcp_read(socket: &mut tcp::Socket, state: &mut TcpSocketState) {
 }
 
 /// Process UDP write path: pull data from channel and send to smoltcp.
-fn process_udp_write(socket: &mut udp::Socket, state: &mut UdpSocketState) {
+fn process_udp_write(socket: &mut udp::Socket, state: &mut UdpSocketState, stats: &TunnelStats) {
     while socket.can_send() {
         match state.write_rx.try_recv() {
             Ok((data, dest)) => {
                 let endpoint = socket_addr_to_endpoint(dest);
-                let _ = socket.send_slice(&data, endpoint);
+                match socket.send_slice(&data, endpoint) {
+                    Ok(()) => {
+                        stats.udp_tx_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        stats.udp_tx_failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -1014,21 +1030,24 @@ fn process_udp_write(socket: &mut udp::Socket, state: &mut UdpSocketState) {
 }
 
 /// Process UDP read path: receive data from smoltcp and push to channel.
-fn process_udp_read(socket: &mut udp::Socket, state: &mut UdpSocketState) {
+fn process_udp_read(socket: &mut udp::Socket, state: &mut UdpSocketState, stats: &TunnelStats) {
     while socket.can_recv() {
         match state.read_tx.try_reserve() {
             Ok(permit) => {
-                let mut buf = vec![0u8; UDP_PACKET_BUFFER_SIZE];
+                let mut buf = [0u8; UDP_READ_BUF_SIZE];
                 match socket.recv_slice(&mut buf) {
                     Ok((n, meta)) => {
-                        buf.truncate(n);
                         let addr = endpoint_to_socket_addr(meta.endpoint);
-                        permit.send((buf, addr));
+                        permit.send((buf[..n].to_vec(), addr));
+                        stats.udp_rx_packets.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => break,
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                stats.udp_rx_dropped.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         }
     }
 }

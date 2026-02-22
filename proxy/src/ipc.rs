@@ -7,7 +7,9 @@ use std::path::Path;
 /// The socket is bound to the given path and set to listen for incoming connections.
 pub fn create_stream_listener(path: &Path) -> io::Result<OwnedFd> {
     // Create STREAM socket
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let fd = unsafe {
+        libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0)
+    };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -28,7 +30,10 @@ pub fn create_stream_listener(path: &Path) -> io::Result<OwnedFd> {
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     addr.sun_path[..path_bytes.len()].copy_from_slice(unsafe {
-        std::slice::from_raw_parts(path_bytes.as_ptr() as *const i8, path_bytes.len())
+        std::slice::from_raw_parts(
+            path_bytes.as_ptr() as *const i8,
+            path_bytes.len(),
+        )
     });
 
     // Bind

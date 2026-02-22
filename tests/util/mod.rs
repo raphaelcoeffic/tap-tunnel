@@ -98,7 +98,9 @@ impl ProxyProcess {
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("tap-tunnel-proxy")))
             .filter(|p| p.exists())
-            .unwrap_or_else(|| std::path::PathBuf::from("target/debug/tap-tunnel-proxy"));
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("target/debug/tap-tunnel-proxy")
+            });
 
         let mut cmd = Command::new(&proxy_path);
         cmd.args([

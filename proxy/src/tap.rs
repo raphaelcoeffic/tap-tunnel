@@ -70,11 +70,13 @@ pub fn create_tap(name: &str) -> io::Result<OwnedFd> {
     // Increase TAP device send buffer for high-throughput forwarding.
     // The default (~212KB) limits throughput under bidirectional load.
     let sndbuf: libc::c_int = 2 * 1024 * 1024; // 2MB
-    let ret = unsafe {
-        libc::ioctl(fd, TUNSETSNDBUF, &sndbuf as *const libc::c_int)
-    };
+    let ret =
+        unsafe { libc::ioctl(fd, TUNSETSNDBUF, &sndbuf as *const libc::c_int) };
     if ret < 0 {
-        log::debug!("TUNSETSNDBUF failed (non-fatal): {}", io::Error::last_os_error());
+        log::debug!(
+            "TUNSETSNDBUF failed (non-fatal): {}",
+            io::Error::last_os_error()
+        );
     }
 
     // Prevent the file from being closed when tun_file is dropped
@@ -102,7 +104,8 @@ fn set_txqueuelen(name: &str, qlen: i32) -> io::Result<()> {
         ifr.ifr_name[i] = b as libc::c_char;
     }
 
-    let ret = unsafe { libc::ioctl(sock, SIOCSIFTXQLEN, &ifr as *const IfReqTxqlen) };
+    let ret =
+        unsafe { libc::ioctl(sock, SIOCSIFTXQLEN, &ifr as *const IfReqTxqlen) };
     unsafe { libc::close(sock) };
     if ret < 0 {
         return Err(io::Error::last_os_error());
@@ -117,15 +120,18 @@ pub fn configure_interface(
     addr: Option<(IpAddr, u8)>,
     mtu: Option<u16>,
 ) -> io::Result<[u8; 6]> {
-    let iface = Interface::try_from_name(name).map_err(|e| io::Error::other(e.to_string()))?;
+    let iface = Interface::try_from_name(name)
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     if let Some((ip, prefix_len)) = addr {
         let net = match ip {
             IpAddr::V4(v4) => ipnet::IpNet::V4(
-                Ipv4Net::new(v4, prefix_len).map_err(|e| io::Error::other(e.to_string()))?,
+                Ipv4Net::new(v4, prefix_len)
+                    .map_err(|e| io::Error::other(e.to_string()))?,
             ),
             IpAddr::V6(v6) => ipnet::IpNet::V6(
-                Ipv6Net::new(v6, prefix_len).map_err(|e| io::Error::other(e.to_string()))?,
+                Ipv6Net::new(v6, prefix_len)
+                    .map_err(|e| io::Error::other(e.to_string()))?,
             ),
         };
         iface

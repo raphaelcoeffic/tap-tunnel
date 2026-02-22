@@ -14,10 +14,14 @@ use smoltcp::phy::Device;
 use smoltcp::socket::tcp::{self, State as TcpState};
 use smoltcp::socket::udp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
+use smoltcp::wire::{
+    EthernetAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint,
+};
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6,
+};
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
@@ -121,7 +125,9 @@ struct UdpSocketState {
 }
 
 /// Create TCP channels for a new socket.
-fn create_tcp_channels(write_notify: Arc<Notify>) -> (TcpChannels, TcpSocketState) {
+fn create_tcp_channels(
+    write_notify: Arc<Notify>,
+) -> (TcpChannels, TcpSocketState) {
     let (write_tx, write_rx) = mpsc::channel(TCP_CHANNEL_CAPACITY);
     let (read_tx, read_rx) = mpsc::channel(TCP_CHANNEL_CAPACITY);
 
@@ -141,7 +147,9 @@ fn create_tcp_channels(write_notify: Arc<Notify>) -> (TcpChannels, TcpSocketStat
 }
 
 /// Create UDP channels for a new socket.
-fn create_udp_channels(write_notify: Arc<Notify>) -> (UdpChannels, UdpSocketState) {
+fn create_udp_channels(
+    write_notify: Arc<Notify>,
+) -> (UdpChannels, UdpSocketState) {
     let (write_tx, write_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
     let (read_tx, read_rx) = mpsc::channel(UDP_CHANNEL_CAPACITY);
 
@@ -170,7 +178,8 @@ pub enum StackCommand {
         /// Optional local IP to bind the socket to. If None, uses the default (config.ip).
         local_ip: Option<IpAddr>,
         addr: SocketAddr,
-        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
+        response:
+            ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
     /// Create a TCP listener and bind to the given address.
     TcpListen {
@@ -182,7 +191,8 @@ pub enum StackCommand {
     /// Returns (handle, local_addr, peer_addr, channels) on success.
     TcpAccept {
         handle: SocketHandle,
-        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
+        response:
+            ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
     /// Close a TCP listener and all its pending sockets.
     TcpListenerClose { handle: SocketHandle },
@@ -219,10 +229,12 @@ enum PendingOp {
         local_addr: SocketAddr,
         peer_addr: SocketAddr,
         channels: TcpChannels,
-        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
+        response:
+            ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
     TcpAccept {
-        response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
+        response:
+            ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
     },
 }
 
@@ -262,7 +274,8 @@ pub async fn run_stack(
     let iface_config = Config::new(mac.into());
 
     let start_timestamp = StdInstant::now();
-    let mut iface = Interface::new(iface_config, device, instant_since(start_timestamp));
+    let mut iface =
+        Interface::new(iface_config, device, instant_since(start_timestamp));
 
     // Configure IP address
     let ip_cidr = IpCidr::new(ip_addr_to_smoltcp(config.ip), config.prefix_len);
@@ -355,7 +368,12 @@ pub async fn run_stack(
         }
 
         // Poll write channels for all sockets (app -> smoltcp)
-        poll_write_channels(&mut sockets, &mut tcp_states, &mut udp_states, &stats);
+        poll_write_channels(
+            &mut sockets,
+            &mut tcp_states,
+            &mut udp_states,
+            &stats,
+        );
 
         // Poll the interface in batches to avoid blocking the runtime
         let timestamp = instant_since(start_timestamp);
@@ -381,7 +399,12 @@ pub async fn run_stack(
         }
 
         // Process read channels for all sockets (smoltcp -> app)
-        poll_read_channels(&mut sockets, &mut tcp_states, &mut udp_states, &stats);
+        poll_read_channels(
+            &mut sockets,
+            &mut tcp_states,
+            &mut udp_states,
+            &stats,
+        );
 
         // Process pending operations that may now be completable
         if socket_state_changed {
@@ -509,7 +532,12 @@ fn handle_tcp_connect(
     config: &StackConfig,
     tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
     write_notify: &Arc<Notify>,
-    response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
+    response: ResponseSender<(
+        SocketHandle,
+        SocketAddr,
+        SocketAddr,
+        TcpChannels,
+    )>,
 ) {
     debug!("tcp_connect to {} from {:?}", addr, local_ip);
 
@@ -541,7 +569,8 @@ fn handle_tcp_connect(
     if let Err(e) = socket.connect(iface.context(), remote, local) {
         warn!("tcp_connect failed: {}", e);
         sockets.remove(handle);
-        let _ = response.send(Err(io::Error::other(format!("connect failed: {}", e))));
+        let _ = response
+            .send(Err(io::Error::other(format!("connect failed: {}", e))));
         return;
     }
 
@@ -650,7 +679,12 @@ fn handle_tcp_accept(
     pending: &mut PendingOps,
     tcp_states: &mut HashMap<SocketHandle, TcpSocketState>,
     write_notify: &Arc<Notify>,
-    response: ResponseSender<(SocketHandle, SocketAddr, SocketAddr, TcpChannels)>,
+    response: ResponseSender<(
+        SocketHandle,
+        SocketAddr,
+        SocketAddr,
+        TcpChannels,
+    )>,
 ) {
     trace!("tcp_accept on handle={:?}", handle);
 
@@ -667,9 +701,12 @@ fn handle_tcp_accept(
     };
 
     // Check if any listening socket has become established
-    if let Some((accepted_handle, local, peer)) = try_accept_socket(sockets, state) {
+    if let Some((accepted_handle, local, peer)) =
+        try_accept_socket(sockets, state)
+    {
         // Create channels for the accepted socket
-        let (channels, socket_state) = create_tcp_channels(Arc::clone(write_notify));
+        let (channels, socket_state) =
+            create_tcp_channels(Arc::clone(write_notify));
         tcp_states.insert(accepted_handle, socket_state);
         let _ = response.send(Ok((accepted_handle, local, peer, channels)));
         return;
@@ -812,7 +849,9 @@ fn handle_udp_bind(
     // Construct the actual bound address (with allocated port if ephemeral)
     let bound_addr = match addr {
         SocketAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(*v4.ip(), port)),
-        SocketAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(*v6.ip(), port, 0, 0)),
+        SocketAddr::V6(v6) => {
+            SocketAddr::V6(SocketAddrV6::new(*v6.ip(), port, 0, 0))
+        }
     };
 
     let endpoint = socket_addr_to_listen_endpoint_with_port(addr, port);
@@ -879,7 +918,11 @@ fn handle_add_ip(
     let _ = response.send(add_result);
 }
 
-fn handle_remove_ip(ip: IpAddr, iface: &mut Interface, response: oneshot::Sender<io::Result<()>>) {
+fn handle_remove_ip(
+    ip: IpAddr,
+    iface: &mut Interface,
+    response: oneshot::Sender<io::Result<()>>,
+) {
     debug!("remove_ip: {}", ip);
     let target = ip_addr_to_smoltcp(ip);
 
@@ -890,7 +933,10 @@ fn handle_remove_ip(ip: IpAddr, iface: &mut Interface, response: oneshot::Sender
     let _ = response.send(Ok(()));
 }
 
-fn handle_get_ips(iface: &Interface, response: oneshot::Sender<Vec<IpWithPrefix>>) {
+fn handle_get_ips(
+    iface: &Interface,
+    response: oneshot::Sender<Vec<IpWithPrefix>>,
+) {
     let ips: Vec<_> = iface
         .ip_addrs()
         .iter()
@@ -1006,7 +1052,11 @@ fn process_tcp_read(socket: &mut tcp::Socket, state: &mut TcpSocketState) {
 }
 
 /// Process UDP write path: pull data from channel and send to smoltcp.
-fn process_udp_write(socket: &mut udp::Socket, state: &mut UdpSocketState, stats: &TunnelStats) {
+fn process_udp_write(
+    socket: &mut udp::Socket,
+    state: &mut UdpSocketState,
+    stats: &TunnelStats,
+) {
     while socket.can_send() {
         match state.write_rx.try_recv() {
             Ok((data, dest)) => {
@@ -1030,7 +1080,11 @@ fn process_udp_write(socket: &mut udp::Socket, state: &mut UdpSocketState, stats
 }
 
 /// Process UDP read path: receive data from smoltcp and push to channel.
-fn process_udp_read(socket: &mut udp::Socket, state: &mut UdpSocketState, stats: &TunnelStats) {
+fn process_udp_read(
+    socket: &mut udp::Socket,
+    state: &mut UdpSocketState,
+    stats: &TunnelStats,
+) {
     while socket.can_recv() {
         match state.read_tx.try_reserve() {
             Ok(permit) => {
@@ -1077,7 +1131,9 @@ fn process_pending(
                             response,
                         }) = pending.remove(&handle)
                         {
-                            let _ = response.send(Ok((handle, local_addr, peer_addr, channels)));
+                            let _ = response.send(Ok((
+                                handle, local_addr, peer_addr, channels,
+                            )));
                         }
                         true
                     }
@@ -1086,8 +1142,9 @@ fn process_pending(
                             "TCP connection failed: handle={:?}, state={:?}",
                             handle, state
                         );
-                        if let Some(PendingOp::TcpConnect { response, .. }) =
-                            pending.remove(&handle)
+                        if let Some(PendingOp::TcpConnect {
+                            response, ..
+                        }) = pending.remove(&handle)
                         {
                             // Remove the socket state since connection failed
                             tcp_states.remove(&handle);
@@ -1104,14 +1161,22 @@ fn process_pending(
             Some(PendingOp::TcpAccept { .. }) => {
                 // Check if we have a listener for this handle and try to accept
                 if let Some(state) = listeners.get_mut(&handle) {
-                    if let Some((accepted_handle, local, peer)) = try_accept_socket(sockets, state)
+                    if let Some((accepted_handle, local, peer)) =
+                        try_accept_socket(sockets, state)
                     {
-                        if let Some(PendingOp::TcpAccept { response }) = pending.remove(&handle) {
+                        if let Some(PendingOp::TcpAccept { response }) =
+                            pending.remove(&handle)
+                        {
                             // Create channels for the accepted socket
                             let (channels, socket_state) =
                                 create_tcp_channels(Arc::clone(write_notify));
                             tcp_states.insert(accepted_handle, socket_state);
-                            let _ = response.send(Ok((accepted_handle, local, peer, channels)));
+                            let _ = response.send(Ok((
+                                accepted_handle,
+                                local,
+                                peer,
+                                channels,
+                            )));
                         }
                         true
                     } else {
@@ -1119,7 +1184,9 @@ fn process_pending(
                     }
                 } else {
                     // Listener was closed, fail the pending accept
-                    if let Some(PendingOp::TcpAccept { response }) = pending.remove(&handle) {
+                    if let Some(PendingOp::TcpAccept { response }) =
+                        pending.remove(&handle)
+                    {
                         let _ = response.send(Err(io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "listener closed",
@@ -1183,7 +1250,10 @@ fn socket_addr_to_listen_endpoint(addr: SocketAddr) -> IpListenEndpoint {
 }
 
 /// Convert a SocketAddr to a smoltcp IpListenEndpoint with a specific port.
-fn socket_addr_to_listen_endpoint_with_port(addr: SocketAddr, port: u16) -> IpListenEndpoint {
+fn socket_addr_to_listen_endpoint_with_port(
+    addr: SocketAddr,
+    port: u16,
+) -> IpListenEndpoint {
     let smoltcp_addr = ip_addr_to_smoltcp(addr.ip());
     IpListenEndpoint {
         addr: if addr.ip().is_unspecified() {
@@ -1203,7 +1273,8 @@ fn make_socket_addr(ip: IpAddr, port: u16) -> SocketAddr {
     }
 }
 
-static EPHEMERAL_PORT: atomic::AtomicU16 = atomic::AtomicU16::new(EPHEMERAL_PORT_START);
+static EPHEMERAL_PORT: atomic::AtomicU16 =
+    atomic::AtomicU16::new(EPHEMERAL_PORT_START);
 
 fn allocate_ephemeral_port() -> u16 {
     EPHEMERAL_PORT.fetch_add(1, atomic::Ordering::Relaxed)

@@ -15,7 +15,12 @@ async fn get_link_index(handle: &Handle, iface_name: &str) -> io::Result<u32> {
     let link = links
         .try_next()
         .await
-        .map_err(|e| io::Error::other(format!("failed to query link {}: {}", iface_name, e)))?
+        .map_err(|e| {
+            io::Error::other(format!(
+                "failed to query link {}: {}",
+                iface_name, e
+            ))
+        })?
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,

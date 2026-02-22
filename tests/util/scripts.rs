@@ -41,7 +41,11 @@ while True:
 
 /// Helper to create a network namespace with a TCP client that connects to the given address.
 /// The client sends a message, receives a response, then exits.
-pub fn tcp_client_ns(ip: &str, port: u16, message: &str) -> Result<UserNetNamespace> {
+pub fn tcp_client_ns(
+    ip: &str,
+    port: u16,
+    message: &str,
+) -> Result<UserNetNamespace> {
     let script = format!(
         r#"
 python3 -c "
@@ -70,7 +74,11 @@ time.sleep(0.5)
 }
 
 /// Helper to create a namespace with multiple TCP clients connecting concurrently.
-pub fn tcp_multi_client_ns(ip: &str, port: u16, num_clients: usize) -> Result<UserNetNamespace> {
+pub fn tcp_multi_client_ns(
+    ip: &str,
+    port: u16,
+    num_clients: usize,
+) -> Result<UserNetNamespace> {
     let script = format!(
         r#"
 python3 -c "
@@ -200,7 +208,11 @@ time.sleep(0.3)
 }
 
 /// Client that sends N bytes and expects N bytes echoed back
-pub fn tcp_large_echo_client_ns(ip: &str, port: u16, size: usize) -> Result<UserNetNamespace> {
+pub fn tcp_large_echo_client_ns(
+    ip: &str,
+    port: u16,
+    size: usize,
+) -> Result<UserNetNamespace> {
     let script = format!(
         r#"
 python3 -c "

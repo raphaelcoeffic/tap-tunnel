@@ -90,10 +90,9 @@ impl TcpStream {
     ///
     /// Returns the number of bytes written.
     pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        self.write_tx
-            .send(buf.to_vec())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
+        self.write_tx.send(buf.to_vec()).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone")
+        })?;
         // Notify stack that there's data to send
         self.write_notify.notify_one();
         Ok(buf.len())
@@ -169,18 +168,23 @@ impl AsyncWrite for TcpStream {
                     "channel full",
                 )))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stack task gone",
-            ))),
+            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(
+                io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"),
+            )),
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(())) // Data is pushed immediately
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         self.close();
         Poll::Ready(Ok(()))
     }
@@ -349,10 +353,9 @@ impl OwnedWriteHalf {
     ///
     /// Returns the number of bytes written.
     pub async fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        self.write_tx
-            .send(buf.to_vec())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
+        self.write_tx.send(buf.to_vec()).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone")
+        })?;
         self.write_notify.notify_one();
         Ok(buf.len())
     }
@@ -393,18 +396,23 @@ impl AsyncWrite for OwnedWriteHalf {
                     "channel full",
                 )))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stack task gone",
-            ))),
+            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(
+                io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"),
+            )),
         }
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
         self.inner.close();
         Poll::Ready(Ok(()))
     }
@@ -456,17 +464,26 @@ impl UdpSocket {
     }
 
     /// Send data to the specified address.
-    pub async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+    pub async fn send_to(
+        &self,
+        buf: &[u8],
+        addr: SocketAddr,
+    ) -> io::Result<usize> {
         self.write_tx
             .send((buf.to_vec(), addr))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone")
+            })?;
         self.write_notify.notify_one();
         Ok(buf.len())
     }
 
     /// Receive data and the source address.
-    pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    pub async fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> io::Result<(usize, SocketAddr)> {
         let mut read_rx = self.read_rx.lock().await;
         match read_rx.recv().await {
             Some((data, addr)) => {
@@ -474,7 +491,9 @@ impl UdpSocket {
                 buf[..len].copy_from_slice(&data[..len]);
                 Ok((len, addr))
             }
-            None => Err(io::Error::new(io::ErrorKind::BrokenPipe, "socket closed")),
+            None => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "socket closed"))
+            }
         }
     }
 
@@ -529,11 +548,14 @@ impl TcpListener {
                 response: tx,
             })
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))?;
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone")
+            })?;
 
-        let (stream_handle, local_addr, peer_addr, channels) = rx
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone"))??;
+        let (stream_handle, local_addr, peer_addr, channels) =
+            rx.await.map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "stack task gone")
+            })??;
 
         Ok((
             TcpStream::from_channels(

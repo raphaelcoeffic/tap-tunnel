@@ -4,7 +4,8 @@ use log::{trace, warn};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol, Ipv4Packet,
+    ArpOperation, ArpPacket, ArpRepr, EthernetFrame, EthernetProtocol,
+    Ipv4Packet,
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -31,7 +32,12 @@ pub struct ProxyDevice {
 
 impl ProxyDevice {
     /// Create a new ProxyDevice with the given channels, MTU, and stats.
-    pub fn new(rx: FrameReceiver, tx: FrameSender, mtu: usize, stats: Arc<TunnelStats>) -> Self {
+    pub fn new(
+        rx: FrameReceiver,
+        tx: FrameSender,
+        mtu: usize,
+        stats: Arc<TunnelStats>,
+    ) -> Self {
         Self { rx, tx, mtu, stats }
     }
 }
@@ -47,12 +53,21 @@ impl Device for ProxyDevice {
         caps
     }
 
-    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: Instant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         match self.rx.try_recv() {
             Ok(frame) => {
                 self.stats.device_rx_frames.fetch_add(1, Ordering::Relaxed);
                 log_frame("RX", &frame);
-                Some((ProxyRxToken { frame }, ProxyTxToken { tx: &self.tx, stats: &self.stats }))
+                Some((
+                    ProxyRxToken { frame },
+                    ProxyTxToken {
+                        tx: &self.tx,
+                        stats: &self.stats,
+                    },
+                ))
             }
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => {
@@ -63,7 +78,10 @@ impl Device for ProxyDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(ProxyTxToken { tx: &self.tx, stats: &self.stats })
+        Some(ProxyTxToken {
+            tx: &self.tx,
+            stats: &self.stats,
+        })
     }
 }
 
@@ -127,7 +145,11 @@ fn log_frame(direction: &str, frame: &[u8]) {
                         ip.next_header()
                     );
                 } else {
-                    trace!("{} {} bytes: IPv4 (malformed)", direction, frame.len());
+                    trace!(
+                        "{} {} bytes: IPv4 (malformed)",
+                        direction,
+                        frame.len()
+                    );
                 }
             }
             EthernetProtocol::Arp => {
@@ -151,14 +173,23 @@ fn log_frame(direction: &str, frame: &[u8]) {
                         );
                     }
                 } else {
-                    trace!("{} {} bytes: ARP (malformed)", direction, frame.len());
+                    trace!(
+                        "{} {} bytes: ARP (malformed)",
+                        direction,
+                        frame.len()
+                    );
                 }
             }
             EthernetProtocol::Ipv6 => {
                 trace!("{} {} bytes: IPv6", direction, frame.len());
             }
             other => {
-                trace!("{} {} bytes: ethertype={:?}", direction, frame.len(), other);
+                trace!(
+                    "{} {} bytes: ethertype={:?}",
+                    direction,
+                    frame.len(),
+                    other
+                );
             }
         }
     } else {

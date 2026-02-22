@@ -82,8 +82,13 @@ pub enum ProxyCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum ProxyResponse {
-    Ok { id: u64 },
-    Error { id: u64, error: String },
+    Ok {
+        id: u64,
+    },
+    Error {
+        id: u64,
+        error: String,
+    },
     IfaceStats {
         id: u64,
         interfaces: HashMap<String, InterfaceStats>,
@@ -94,7 +99,9 @@ impl ProxyResponse {
     /// Get the request ID from any response variant.
     pub fn id(&self) -> u64 {
         match self {
-            Self::Ok { id, .. } | Self::Error { id, .. } | Self::IfaceStats { id, .. } => *id,
+            Self::Ok { id, .. }
+            | Self::Error { id, .. }
+            | Self::IfaceStats { id, .. } => *id,
         }
     }
 
@@ -120,8 +127,8 @@ pub enum Message {
 
 /// Encode a control message for transmission.
 pub fn encode_control<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
-    let json =
-        serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let json = serde_json::to_vec(msg)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut buf = Vec::with_capacity(1 + json.len());
     buf.push(MSG_TYPE_CONTROL);
     buf.extend_from_slice(&json);
@@ -129,8 +136,11 @@ pub fn encode_control<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
 }
 
 /// Decode a control message from JSON bytes.
-pub fn decode_control<T: for<'de> Deserialize<'de>>(data: &[u8]) -> io::Result<T> {
-    serde_json::from_slice(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+pub fn decode_control<T: for<'de> Deserialize<'de>>(
+    data: &[u8],
+) -> io::Result<T> {
+    serde_json::from_slice(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Encode an Ethernet frame for transmission.
@@ -144,7 +154,10 @@ pub fn encode_frame(frame: &[u8]) -> Vec<u8> {
 /// Decode a message from the wire.
 pub fn decode_message(data: &[u8]) -> io::Result<Message> {
     if data.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty message"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty message",
+        ));
     }
 
     let msg_type = data[0];
@@ -163,7 +176,10 @@ pub fn decode_message(data: &[u8]) -> io::Result<Message> {
 /// Write a length-prefixed message (blocking I/O).
 ///
 /// Wire format: `[4-byte big-endian length][message bytes]`
-pub fn write_framed_sync(writer: &mut impl Write, msg: &[u8]) -> io::Result<()> {
+pub fn write_framed_sync(
+    writer: &mut impl Write,
+    msg: &[u8],
+) -> io::Result<()> {
     let len = (msg.len() as u32).to_be_bytes();
     writer.write_all(&len)?;
     writer.write_all(msg)?;
@@ -173,12 +189,18 @@ pub fn write_framed_sync(writer: &mut impl Write, msg: &[u8]) -> io::Result<()> 
 /// Read a length-prefixed message (blocking I/O).
 ///
 /// Returns the number of bytes read into `buf`.
-pub fn read_framed_sync(reader: &mut impl Read, buf: &mut Vec<u8>) -> io::Result<usize> {
+pub fn read_framed_sync(
+    reader: &mut impl Read,
+    buf: &mut Vec<u8>,
+) -> io::Result<usize> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
     if len == 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "zero-length frame"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zero-length frame",
+        ));
     }
     if buf.len() < len {
         buf.resize(len, 0);
@@ -210,7 +232,11 @@ pub fn default_client_ip(tap_ip: IpAddr) -> IpAddr {
 }
 
 /// Validate that an IP is in the same subnet as the TAP IP.
-pub fn validate_ip_in_subnet(ip: IpAddr, tap_ip: IpAddr, prefix_len: u8) -> bool {
+pub fn validate_ip_in_subnet(
+    ip: IpAddr,
+    tap_ip: IpAddr,
+    prefix_len: u8,
+) -> bool {
     match (ip, tap_ip) {
         (IpAddr::V4(ip), IpAddr::V4(tap)) => {
             let mask = if prefix_len >= 32 {
@@ -282,7 +308,8 @@ mod tests {
     #[test]
     fn test_encode_decode_frame() {
         let frame = vec![
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44,
+            0x55,
         ];
         let encoded = encode_frame(&frame);
         assert_eq!(encoded[0], MSG_TYPE_FRAME);

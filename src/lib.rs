@@ -156,20 +156,35 @@ pub struct TunnelStatsSnapshot {
 
 impl fmt::Display for TunnelStatsSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "IPC:    rx={} rx_drop={} tx={} tx_err={}",
-            self.ipc_rx_frames, self.ipc_rx_dropped,
-            self.ipc_tx_frames, self.ipc_tx_errors)?;
-        writeln!(f, "Device: rx={} tx={} tx_drop={}",
-            self.device_rx_frames, self.device_tx_frames, self.device_tx_dropped)?;
-        write!(f, "UDP:    tx={} tx_fail={} rx={} rx_drop={}",
-            self.udp_tx_packets, self.udp_tx_failed,
-            self.udp_rx_packets, self.udp_rx_dropped)
+        writeln!(
+            f,
+            "IPC:    rx={} rx_drop={} tx={} tx_err={}",
+            self.ipc_rx_frames,
+            self.ipc_rx_dropped,
+            self.ipc_tx_frames,
+            self.ipc_tx_errors
+        )?;
+        writeln!(
+            f,
+            "Device: rx={} tx={} tx_drop={}",
+            self.device_rx_frames,
+            self.device_tx_frames,
+            self.device_tx_dropped
+        )?;
+        write!(
+            f,
+            "UDP:    tx={} tx_fail={} rx={} rx_drop={}",
+            self.udp_tx_packets,
+            self.udp_tx_failed,
+            self.udp_rx_packets,
+            self.udp_rx_dropped
+        )
     }
 }
 
 pub use socket::{
-    OwnedReadHalf, OwnedWriteHalf, TcpListener as TunnelTcpListener, TcpStream as TunnelTcpStream,
-    UdpSocket as TunnelUdpSocket,
+    OwnedReadHalf, OwnedWriteHalf, TcpListener as TunnelTcpListener,
+    TcpStream as TunnelTcpStream, UdpSocket as TunnelUdpSocket,
 };
 
 /// Capacity of the command channel between async API and stack task.
@@ -324,8 +339,9 @@ pub struct Tunnel {
 }
 
 /// Pending proxy response senders, keyed by request ID.
-type PendingProxyResponses =
-    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<protocol::ProxyResponse>>>>;
+type PendingProxyResponses = Arc<
+    Mutex<HashMap<u64, tokio::sync::oneshot::Sender<protocol::ProxyResponse>>>,
+>;
 
 struct TunnelInner {
     /// Channel to send commands to the stack task
@@ -339,19 +355,21 @@ struct TunnelInner {
     /// Local IP (first IP added to the interface)
     local_addr: IpWithPrefix,
     /// Whether close() has been called
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     /// Atomic counter for proxy command request IDs
     next_request_id: AtomicU64,
     /// Map of pending proxy command responses
     pending_proxy_responses: PendingProxyResponses,
     /// Data path statistics
     stats: Arc<TunnelStats>,
+    /// JoinHandles for IPC reader, IPC writer, and stack tasks (aborted on close)
+    task_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl TunnelInner {
-    /// Kill the proxy child process if not already closed.
+    /// Kill the proxy child process and abort IPC/stack tasks.
     ///
-    /// Idempotent — the `closed` flag ensures the kill happens at most once.
+    /// Idempotent — the `closed` flag ensures cleanup happens at most once.
     fn close(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
@@ -363,17 +381,18 @@ impl TunnelInner {
             }
             *guard = None;
         }
+        // Abort IPC reader, IPC writer, and stack tasks to release socket FDs
+        if let Ok(mut handles) = self.task_handles.lock() {
+            for handle in handles.drain(..) {
+                handle.abort();
+            }
+        }
     }
 }
 
 impl Drop for TunnelInner {
     fn drop(&mut self) {
         self.close();
-        // The stack task will exit when:
-        // 1. self.commands is dropped (after this method returns), disconnecting the channel
-        // 2. The stack detects TryRecvError::Disconnected and returns
-        // We intentionally don't join() to avoid blocking the async runtime.
-        // The task will clean up on its own.
     }
 }
 
@@ -465,14 +484,17 @@ fn remove_cloexec(fd: &OwnedFd) -> io::Result<()> {
 }
 
 /// Spawn the proxy binary.
-fn spawn_proxy(pid: u32, frame_fd: OwnedFd, config: &TapConfig) -> io::Result<Child> {
+fn spawn_proxy(
+    pid: u32,
+    frame_fd: OwnedFd,
+    config: &TapConfig,
+) -> io::Result<Child> {
     remove_cloexec(&frame_fd)?;
 
     let proxy_path = find_proxy_binary()?;
     let frame_fd_num = frame_fd.as_raw_fd();
 
     let mut cmd = Command::new(&proxy_path);
-    cmd.stderr(Stdio::piped());
     cmd.arg("--pid").arg(pid.to_string());
     cmd.arg("--frame-fd").arg(frame_fd_num.to_string());
     cmd.arg("--tap-name").arg(&config.interface_name);
@@ -500,8 +522,9 @@ fn spawn_proxy(pid: u32, frame_fd: OwnedFd, config: &TapConfig) -> io::Result<Ch
         )
     })?;
 
-    // Prevent the FD from being closed - proxy now owns it
-    std::mem::forget(frame_fd);
+    // Close the child's end of the socketpair in the parent process.
+    // The proxy process has inherited its own copy of this FD.
+    drop(frame_fd);
 
     Ok(child)
 }
@@ -537,15 +560,21 @@ impl Tunnel {
     /// Connect to the network namespace of the given PID with custom configuration.
     ///
     /// This spawns a TAP proxy process and starts a smoltcp stack task.
-    pub async fn connect_with_config(pid: u32, config: TapConfig) -> io::Result<Self> {
+    pub async fn connect_with_config(
+        pid: u32,
+        config: TapConfig,
+    ) -> io::Result<Self> {
         Self::connect_with_config_blocking(pid, config)
     }
 
     /// Synchronous version of connect_with_config.
-    pub fn connect_with_config_blocking(pid: u32, mut config: TapConfig) -> io::Result<Self> {
+    pub fn connect_with_config_blocking(
+        pid: u32,
+        mut config: TapConfig,
+    ) -> io::Result<Self> {
         use protocol::{
-            ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
-            encode_control, write_framed_sync,
+            ClientHello, Message, ProxyConfig, decode_control, decode_message,
+            default_client_ip, encode_control, write_framed_sync,
         };
         use std::io::Read;
 
@@ -566,7 +595,8 @@ impl Tunnel {
 
         // Receive ProxyConfig with timeout and child-exit monitoring (length-prefix framed)
         stream.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(5);
 
         // Read the 4-byte length prefix with timeout/retry
         let mut len_buf = [0u8; 4];
@@ -578,7 +608,10 @@ impl Tunnel {
                     let msg = if stderr.is_empty() {
                         "proxy closed connection during handshake".to_string()
                     } else {
-                        format!("proxy closed connection during handshake: {}", stderr)
+                        format!(
+                            "proxy closed connection during handshake: {}",
+                            stderr
+                        )
                     };
                     return Err(unexpected_eof(&msg));
                 }
@@ -691,8 +724,9 @@ impl Tunnel {
         local_ip: Option<IpAddr>,
     ) -> io::Result<Self> {
         use protocol::{
-            ClientHello, Message, ProxyConfig, decode_control, decode_message, default_client_ip,
-            encode_control, read_framed_sync, write_framed_sync,
+            ClientHello, Message, ProxyConfig, decode_control, decode_message,
+            default_client_ip, encode_control, read_framed_sync,
+            write_framed_sync,
         };
 
         let socket_path = socket_path.as_ref();
@@ -729,7 +763,8 @@ impl Tunnel {
         let gateway = (proxy_config.tap_ip, proxy_config.tap_mac);
 
         // Client picks its own IP: use provided local_ip or default (tap_ip + 1)
-        let client_ip = local_ip.unwrap_or_else(|| default_client_ip(proxy_config.tap_ip));
+        let client_ip =
+            local_ip.unwrap_or_else(|| default_client_ip(proxy_config.tap_ip));
 
         // Build TapConfig from received config, using the proxy's reported MTU
         let config = TapConfig::new()
@@ -807,15 +842,27 @@ impl Tunnel {
         let ipc_dead_reader = Arc::clone(&ipc_dead);
         let ipc_dead_writer = Arc::clone(&ipc_dead);
 
+        // Closed flag
+        let closed = Arc::new(AtomicBool::new(false));
+        // let closed_reader = Arc::clone(&closed);
+        // let closed_writer = Arc::clone(&closed);
+
         // Spawn IPC reader task (proxy -> stack) with length-prefix framing
-        tokio::spawn(async move {
-            use protocol::{Message, ProxyResponse, decode_control, decode_message};
+        let ipc_reader_handle = tokio::spawn(async move {
+            use protocol::{
+                Message, ProxyResponse, decode_control, decode_message,
+            };
             use tokio::io::AsyncReadExt;
 
             debug!("[IPC-RX] reader task starting (stream mode)");
-            let mut reader = tokio::io::BufReader::with_capacity(LIB_IPC_BUFFER_SIZE, ipc_read_half);
+            let mut reader = tokio::io::BufReader::with_capacity(
+                LIB_IPC_BUFFER_SIZE,
+                ipc_read_half,
+            );
             let mut len_buf = [0u8; 4];
             let mut msg_buf = vec![0u8; 2048];
+
+            // while !closed_reader.load(Ordering::Relaxed) {
             loop {
                 // Read length prefix
                 match reader.read_exact(&mut len_buf).await {
@@ -837,7 +884,8 @@ impl Tunnel {
                 }
 
                 // Read message body
-                if let Err(e) = reader.read_exact(&mut msg_buf[..msg_len]).await {
+                if let Err(e) = reader.read_exact(&mut msg_buf[..msg_len]).await
+                {
                     debug!("[IPC-RX] read error during body: {}", e);
                     ipc_dead_reader.store(true, Ordering::Relaxed);
                     break;
@@ -845,11 +893,15 @@ impl Tunnel {
 
                 match decode_message(&msg_buf[..msg_len]) {
                     Ok(Message::Frame(frame)) => {
-                        stats_ipc_reader.ipc_rx_frames.fetch_add(1, Ordering::Relaxed);
+                        stats_ipc_reader
+                            .ipc_rx_frames
+                            .fetch_add(1, Ordering::Relaxed);
                         match frame_tx.try_send(frame) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                stats_ipc_reader.ipc_rx_dropped.fetch_add(1, Ordering::Relaxed);
+                                stats_ipc_reader
+                                    .ipc_rx_dropped
+                                    .fetch_add(1, Ordering::Relaxed);
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 break;
@@ -857,9 +909,13 @@ impl Tunnel {
                         }
                     }
                     Ok(Message::Control(payload)) => {
-                        if let Ok(resp) = decode_control::<ProxyResponse>(&payload) {
+                        if let Ok(resp) =
+                            decode_control::<ProxyResponse>(&payload)
+                        {
                             let sender = {
-                                pending_for_reader.lock().ok()
+                                pending_for_reader
+                                    .lock()
+                                    .ok()
                                     .and_then(|mut map| map.remove(&resp.id()))
                             };
                             if let Some(tx) = sender {
@@ -870,15 +926,19 @@ impl Tunnel {
                     Err(_) => {} // Ignore decode errors
                 }
             }
+            debug!("[IPC-RX] reader task exit");
         });
 
         // Spawn IPC writer task (stack -> proxy) with batched length-prefix framing
-        tokio::spawn(async move {
+        let ipc_writer_handle = tokio::spawn(async move {
             use protocol::encode_frame;
             use tokio::io::AsyncWriteExt;
 
             debug!("[IPC-TX] writer task starting (stream mode)");
-            let mut writer = tokio::io::BufWriter::with_capacity(LIB_IPC_BUFFER_SIZE, ipc_write_half);
+            let mut writer = tokio::io::BufWriter::with_capacity(
+                LIB_IPC_BUFFER_SIZE,
+                ipc_write_half,
+            );
             loop {
                 // Wait for the first frame or control message
                 tokio::select! {
@@ -924,11 +984,15 @@ impl Tunnel {
                     if writer.write_all(&len).await.is_err()
                         || writer.write_all(&msg).await.is_err()
                     {
-                        stats_ipc_writer.ipc_tx_errors.fetch_add(1, Ordering::Relaxed);
+                        stats_ipc_writer
+                            .ipc_tx_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         ipc_dead_writer.store(true, Ordering::Relaxed);
                         break;
                     }
-                    stats_ipc_writer.ipc_tx_frames.fetch_add(1, Ordering::Relaxed);
+                    stats_ipc_writer
+                        .ipc_tx_frames
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 while let Ok(msg) = control_rx.try_recv() {
                     let len = (msg.len() as u32).to_be_bytes();
@@ -947,29 +1011,49 @@ impl Tunnel {
                     break;
                 }
             }
+            debug!("[IPC-TX] writer task exit");
         });
 
         // Create device for smoltcp
         let ethernet_frame_size = config.mtu as usize + ETHERNET_HEADER_SIZE;
         let stats_device = Arc::clone(&stats);
-        let device = ProxyDevice::new(frame_rx, frame_to_proxy_tx, ethernet_frame_size, stats_device);
+        let device = ProxyDevice::new(
+            frame_rx,
+            frame_to_proxy_tx,
+            ethernet_frame_size,
+            stats_device,
+        );
 
         // Spawn stack task (will exit when command channel disconnects or IPC dies).
         // Only wrap with FaultInjector when packet loss is configured, because
         // FaultInjector caps MTU at 1536 (smoltcp internal limit).
         let packet_loss = config.packet_loss_percent;
-        if packet_loss > 0 {
+        let stack_handle = if packet_loss > 0 {
             let mut device = FaultInjector::new(device, random_seed());
             device.set_drop_chance(packet_loss);
             tokio::spawn(async move {
-                stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead, stats_stack).await;
-            });
+                stack::run_stack(
+                    &mut device,
+                    stack_config,
+                    cmd_rx,
+                    ipc_dead,
+                    stats_stack,
+                )
+                .await;
+            })
         } else {
             let mut device = device;
             tokio::spawn(async move {
-                stack::run_stack(&mut device, stack_config, cmd_rx, ipc_dead, stats_stack).await;
-            });
-        }
+                stack::run_stack(
+                    &mut device,
+                    stack_config,
+                    cmd_rx,
+                    ipc_dead,
+                    stats_stack,
+                )
+                .await;
+            })
+        };
 
         Ok(Tunnel {
             inner: Arc::new(TunnelInner {
@@ -978,10 +1062,15 @@ impl Tunnel {
                 proxy_child: Mutex::new(proxy_child),
                 gateway,
                 local_addr: (local_ip, local_prefix),
-                closed: AtomicBool::new(false),
+                closed,
                 next_request_id: AtomicU64::new(1),
                 pending_proxy_responses,
                 stats,
+                task_handles: Mutex::new(vec![
+                    ipc_reader_handle,
+                    ipc_writer_handle,
+                    stack_handle,
+                ]),
             }),
         })
     }
@@ -1018,7 +1107,10 @@ impl Tunnel {
     ///
     /// The listener will accept incoming connections from the network namespace.
     /// Use `accept()` to accept connections.
-    pub async fn tcp_listen(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+    pub async fn tcp_listen(
+        &self,
+        addr: SocketAddr,
+    ) -> io::Result<TcpListener> {
         self.tcp_listen_with_backlog(addr, DEFAULT_TCP_BACKLOG)
             .await
     }
@@ -1044,7 +1136,8 @@ impl Tunnel {
             .await
             .map_err(|_| broken_pipe("stack task gone"))?;
 
-        let (handle, local_addr) = rx.await.map_err(|_| broken_pipe("stack task gone"))??;
+        let (handle, local_addr) =
+            rx.await.map_err(|_| broken_pipe("stack task gone"))??;
 
         Ok(TcpListener::from_handle(
             handle,
@@ -1111,7 +1204,11 @@ impl Tunnel {
     ///
     /// This allows the tunnel to send/receive traffic using this IP.
     /// The prefix length determines the subnet mask for routing.
-    pub async fn add_local_ip(&self, ip: IpAddr, prefix_len: u8) -> io::Result<()> {
+    pub async fn add_local_ip(
+        &self,
+        ip: IpAddr,
+        prefix_len: u8,
+    ) -> io::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.inner
@@ -1161,7 +1258,11 @@ impl Tunnel {
     /// destination through the TAP device, enabling cross-subnet communication.
     /// Use this together with `add_local_ip` when the local IP is outside
     /// the TAP interface's subnet.
-    pub async fn add_peer_route(&self, dest: IpAddr, prefix_len: u8) -> io::Result<()> {
+    pub async fn add_peer_route(
+        &self,
+        dest: IpAddr,
+        prefix_len: u8,
+    ) -> io::Result<()> {
         let resp = self
             .send_proxy_command(protocol::ProxyCommand::AddRoute {
                 id: 0,
@@ -1171,13 +1272,19 @@ impl Tunnel {
             .await?;
         match resp {
             protocol::ProxyResponse::Ok { .. } => Ok(()),
-            protocol::ProxyResponse::Error { error, .. } => Err(io::Error::other(error)),
+            protocol::ProxyResponse::Error { error, .. } => {
+                Err(io::Error::other(error))
+            }
             _ => Err(io::Error::other("unexpected response")),
         }
     }
 
     /// Remove a route from the TAP interface in the namespace.
-    pub async fn remove_peer_route(&self, dest: IpAddr, prefix_len: u8) -> io::Result<()> {
+    pub async fn remove_peer_route(
+        &self,
+        dest: IpAddr,
+        prefix_len: u8,
+    ) -> io::Result<()> {
         let resp = self
             .send_proxy_command(protocol::ProxyCommand::RemoveRoute {
                 id: 0,
@@ -1187,7 +1294,9 @@ impl Tunnel {
             .await?;
         match resp {
             protocol::ProxyResponse::Ok { .. } => Ok(()),
-            protocol::ProxyResponse::Error { error, .. } => Err(io::Error::other(error)),
+            protocol::ProxyResponse::Error { error, .. } => {
+                Err(io::Error::other(error))
+            }
             _ => Err(io::Error::other("unexpected response")),
         }
     }
@@ -1202,8 +1311,12 @@ impl Tunnel {
             .send_proxy_command(protocol::ProxyCommand::GetIfaceStats { id: 0 })
             .await?;
         match resp {
-            protocol::ProxyResponse::IfaceStats { interfaces, .. } => Ok(interfaces),
-            protocol::ProxyResponse::Error { error, .. } => Err(io::Error::other(error)),
+            protocol::ProxyResponse::IfaceStats { interfaces, .. } => {
+                Ok(interfaces)
+            }
+            protocol::ProxyResponse::Error { error, .. } => {
+                Err(io::Error::other(error))
+            }
             _ => Err(io::Error::other("unexpected response")),
         }
     }

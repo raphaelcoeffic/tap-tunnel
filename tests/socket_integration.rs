@@ -37,7 +37,8 @@ use util::*;
 async fn test_tcp_connect_and_exchange() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(18080).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(18080).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     // Give the server time to start
@@ -71,7 +72,8 @@ async fn test_tcp_connect_and_exchange() {
 async fn test_tcp_multiple_messages() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(18081).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(18081).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -105,7 +107,8 @@ async fn test_tcp_multiple_messages() {
 async fn test_tcp_multiple_connections() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(18082).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(18082).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -140,7 +143,8 @@ async fn test_tcp_multiple_connections() {
 async fn test_tcp_large_transfer() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(18083).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(18083).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -174,7 +178,12 @@ async fn test_tcp_large_transfer() {
         }
 
         let mut buf = [0u8; 8192];
-        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            stream.read(&mut buf),
+        )
+        .await
+        {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
             Ok(Err(e)) => panic!("read error: {}", e),
@@ -196,7 +205,8 @@ async fn test_tcp_large_transfer() {
 async fn test_tcp_retransmission_with_packet_loss() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(18090).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(18090).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -213,7 +223,8 @@ async fn test_tcp_retransmission_with_packet_loss() {
         .await
         .expect("failed to connect to namespace");
 
-    let server_addr: std::net::SocketAddr = format!("{}:18090", PEER_IP).parse().unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("{}:18090", PEER_IP).parse().unwrap();
     let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
@@ -255,7 +266,8 @@ async fn test_tcp_retransmission_with_packet_loss() {
 async fn test_udp_send_recv() {
     init_logging();
 
-    let ns_proc = udp_echo_server_ns(15000).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(15000).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -265,14 +277,16 @@ async fn test_udp_send_recv() {
         .expect("failed to connect to namespace");
 
     // Bind UDP socket on local address
-    let local_bind: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
+    let local_bind: std::net::SocketAddr =
+        format!("{}:0", LOCAL_IP).parse().unwrap();
     let socket = tunnel
         .udp_bind(local_bind)
         .await
         .expect("failed to udp_bind");
 
     // Send data to server
-    let server_addr: std::net::SocketAddr = format!("{}:15000", PEER_IP).parse().unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("{}:15000", PEER_IP).parse().unwrap();
     socket
         .send_to(b"hello udp", server_addr)
         .await
@@ -288,7 +302,8 @@ async fn test_udp_send_recv() {
 
 #[tokio::test]
 async fn test_udp_multiple_messages() {
-    let ns_proc = udp_echo_server_ns(15002).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(15002).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -297,13 +312,15 @@ async fn test_udp_multiple_messages() {
         .await
         .expect("failed to connect to namespace");
 
-    let local_bind: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
+    let local_bind: std::net::SocketAddr =
+        format!("{}:0", LOCAL_IP).parse().unwrap();
     let socket = tunnel
         .udp_bind(local_bind)
         .await
         .expect("failed to udp_bind");
 
-    let server_addr: std::net::SocketAddr = format!("{}:15002", PEER_IP).parse().unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("{}:15002", PEER_IP).parse().unwrap();
 
     for i in 0..5 {
         let msg = format!("msg {}", i);
@@ -313,7 +330,8 @@ async fn test_udp_multiple_messages() {
             .expect("send_to failed");
 
         let mut buf = [0u8; 64];
-        let (n, _) = socket.recv_from(&mut buf).await.expect("recv_from failed");
+        let (n, _) =
+            socket.recv_from(&mut buf).await.expect("recv_from failed");
         let response = String::from_utf8_lossy(&buf[..n]);
         assert_eq!(response, format!("echo: msg {}", i));
     }
@@ -328,21 +346,23 @@ async fn test_socket_path_mode_tcp() {
     use std::path::Path;
 
     // Use a unique socket path in /tmp
-    let socket_path = format!("/tmp/tap-tunnel-test-{}.sock", std::process::id());
+    let socket_path =
+        format!("/tmp/tap-tunnel-test-{}.sock", std::process::id());
 
     // Clean up any existing socket
     let _ = std::fs::remove_file(&socket_path);
 
     // First, create a namespace with a TCP echo server
-    let ns_proc = tcp_echo_server_ns(18100).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(18100).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     // Give the server time to start
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Start proxy in socket-path mode, pointing to the namespace
-    let _proxy =
-        ProxyProcess::new(pid, &socket_path).expect("failed to start proxy in socket-path mode");
+    let _proxy = ProxyProcess::new(pid, &socket_path)
+        .expect("failed to start proxy in socket-path mode");
 
     // Wait for socket to be created
     for _ in 0..50 {
@@ -393,18 +413,20 @@ async fn test_socket_path_mode_requested_ip() {
     use std::path::Path;
 
     // Use a unique socket path
-    let socket_path = format!("/tmp/tap-tunnel-test-reqip-{}.sock", std::process::id());
+    let socket_path =
+        format!("/tmp/tap-tunnel-test-reqip-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
     // Create a namespace with a TCP echo server
-    let ns_proc = tcp_echo_server_ns(18101).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(18101).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Start proxy in socket-path mode
-    let _proxy =
-        ProxyProcess::new(pid, &socket_path).expect("failed to start proxy in socket-path mode");
+    let _proxy = ProxyProcess::new(pid, &socket_path)
+        .expect("failed to start proxy in socket-path mode");
 
     // Wait for socket to be created
     for _ in 0..50 {
@@ -470,7 +492,8 @@ async fn test_tcp_listen_accept() {
     assert_eq!(listener.local_addr().port(), 19000);
 
     // Accept connection from client in namespace
-    let accept_result = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+    let accept_result =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
 
     let (mut stream, peer_addr) = accept_result
         .expect("accept timed out")
@@ -512,7 +535,9 @@ async fn test_tcp_listen_multiple_accepts() {
 
     // Accept 3 connections
     for i in 0..3 {
-        let accept_result = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+        let accept_result =
+            tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await;
 
         let (mut stream, _peer_addr) = accept_result
             .unwrap_or_else(|_| panic!("accept {} timed out", i))
@@ -556,7 +581,9 @@ async fn test_tcp_listen_with_backlog() {
     // Accept all 5 connections (they may come in any order)
     let mut accepted = 0;
     for _ in 0..5 {
-        let accept_result = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+        let accept_result =
+            tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await;
 
         match accept_result {
             Ok(Ok((mut stream, _peer_addr))) => {
@@ -589,7 +616,8 @@ async fn test_tcp_listener_close() {
     init_logging();
 
     // Create a simple namespace (just needs to exist for the tunnel)
-    let ns_proc = tcp_echo_server_ns(19003).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19003).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     let tunnel = Tunnel::connect_with_config(pid, test_config())
@@ -628,8 +656,8 @@ async fn test_tunnel_server_echo() {
     init_logging();
 
     // Create namespace with a client that sends data and expects echo response
-    let ns_proc =
-        tcp_client_ns(&LOCAL_IP.to_string(), 19100, "ping").expect("failed to create namespace");
+    let ns_proc = tcp_client_ns(&LOCAL_IP.to_string(), 19100, "ping")
+        .expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     let tunnel = Tunnel::connect_with_config(pid, test_config())
@@ -642,10 +670,11 @@ async fn test_tunnel_server_echo() {
         .expect("failed to listen");
 
     // Accept and implement echo server
-    let (mut stream, peer) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .expect("accept timed out")
-        .expect("accept failed");
+    let (mut stream, peer) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept timed out")
+            .expect("accept failed");
 
     assert!(peer.port() > 0, "peer should have valid port");
 
@@ -663,7 +692,8 @@ async fn test_tunnel_server_echo() {
 #[tokio::test]
 async fn test_tunnel_client_request_response() {
     // Server in namespace that receives "request" and sends back "response"
-    let ns_proc = tcp_request_response_server_ns(19101).expect("failed to create namespace");
+    let ns_proc = tcp_request_response_server_ns(19101)
+        .expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -705,10 +735,11 @@ async fn test_tunnel_server_multi_exchange() {
         .await
         .expect("failed to listen");
 
-    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-        .await
-        .expect("accept timed out")
-        .expect("accept failed");
+    let (mut stream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept timed out")
+            .expect("accept failed");
 
     // Handle 5 request-response exchanges
     for i in 0..5 {
@@ -728,7 +759,8 @@ async fn test_tunnel_server_multi_exchange() {
 /// Test tunnel client with large bidirectional transfer.
 #[tokio::test]
 async fn test_tunnel_client_large_bidirectional() {
-    let ns_proc = tcp_echo_server_ns(19103).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19103).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -758,7 +790,12 @@ async fn test_tunnel_client_large_bidirectional() {
             );
         }
         let mut buf = [0u8; 8192];
-        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            stream.read(&mut buf),
+        )
+        .await
+        {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
             Ok(Err(e)) => panic!("read error: {}", e),
@@ -789,10 +826,11 @@ async fn test_tunnel_server_large_bidirectional() {
         .await
         .expect("failed to listen");
 
-    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .expect("accept timed out")
-        .expect("accept failed");
+    let (mut stream, _) =
+        tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("accept timed out")
+            .expect("accept failed");
 
     // Read all data from client
     let mut received = Vec::new();
@@ -802,7 +840,12 @@ async fn test_tunnel_server_large_bidirectional() {
             panic!("timeout reading from client: got {} bytes", received.len());
         }
         let mut buf = [0u8; 8192];
-        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            stream.read(&mut buf),
+        )
+        .await
+        {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
             Ok(Err(e)) => panic!("read error: {}", e),
@@ -819,7 +862,8 @@ async fn test_tunnel_server_large_bidirectional() {
 /// Test concurrent client connections from tunnel.
 #[tokio::test]
 async fn test_tunnel_concurrent_clients() {
-    let ns_proc = tcp_echo_server_ns(19105).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19105).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -842,7 +886,9 @@ async fn test_tunnel_concurrent_clients() {
 
             let mut buf = [0u8; 64];
             let n = stream.read(&mut buf).await?;
-            Ok::<_, std::io::Error>(String::from_utf8_lossy(&buf[..n]).to_string())
+            Ok::<_, std::io::Error>(
+                String::from_utf8_lossy(&buf[..n]).to_string(),
+            )
         });
         handles.push((i, handle));
     }
@@ -862,7 +908,8 @@ async fn test_tunnel_concurrent_clients() {
 /// Test that gateway() returns the proxy's TAP IP and MAC address.
 #[tokio::test]
 async fn test_tunnel_gateway() {
-    let ns_proc = tcp_echo_server_ns(19200).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19200).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -886,7 +933,8 @@ async fn test_tunnel_gateway() {
 /// Test that local_ips() returns the configured IP addresses.
 #[tokio::test]
 async fn test_tunnel_local_ips() {
-    let ns_proc = tcp_echo_server_ns(19201).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19201).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -907,7 +955,8 @@ async fn test_tunnel_local_ips() {
 /// Test adding and removing IP addresses.
 #[tokio::test]
 async fn test_tunnel_add_remove_ip() {
-    let ns_proc = tcp_echo_server_ns(19202).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19202).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -917,7 +966,8 @@ async fn test_tunnel_add_remove_ip() {
         .expect("failed to connect");
 
     // Get initial IPs
-    let initial_ips = tunnel.local_ips().await.expect("failed to get local IPs");
+    let initial_ips =
+        tunnel.local_ips().await.expect("failed to get local IPs");
     let initial_count = initial_ips.len();
 
     // Add a new IP
@@ -928,7 +978,8 @@ async fn test_tunnel_add_remove_ip() {
         .expect("failed to add IP");
 
     // Verify it was added
-    let ips_after_add = tunnel.local_ips().await.expect("failed to get local IPs");
+    let ips_after_add =
+        tunnel.local_ips().await.expect("failed to get local IPs");
     assert_eq!(
         ips_after_add.len(),
         initial_count + 1,
@@ -944,7 +995,8 @@ async fn test_tunnel_add_remove_ip() {
         .add_local_ip(new_ip, PREFIX_LEN)
         .await
         .expect("adding same IP again should succeed");
-    let ips_after_dup = tunnel.local_ips().await.expect("failed to get local IPs");
+    let ips_after_dup =
+        tunnel.local_ips().await.expect("failed to get local IPs");
     assert_eq!(
         ips_after_dup.len(),
         initial_count + 1,
@@ -958,7 +1010,8 @@ async fn test_tunnel_add_remove_ip() {
         .expect("failed to remove IP");
 
     // Verify it was removed
-    let ips_after_remove = tunnel.local_ips().await.expect("failed to get local IPs");
+    let ips_after_remove =
+        tunnel.local_ips().await.expect("failed to get local IPs");
     assert_eq!(
         ips_after_remove.len(),
         initial_count,
@@ -973,7 +1026,8 @@ async fn test_tunnel_add_remove_ip() {
 /// Test tcp_connect_from() - connecting from a specific local IP.
 #[tokio::test]
 async fn test_tunnel_tcp_connect_from() {
-    let ns_proc = tcp_echo_server_ns(19203).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19203).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1003,7 +1057,8 @@ async fn test_tunnel_tcp_connect_from() {
 /// Test connecting from a dynamically added IP address.
 #[tokio::test]
 async fn test_tunnel_tcp_connect_from_added_ip() {
-    let ns_proc = tcp_echo_server_ns(19204).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19204).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1047,7 +1102,8 @@ async fn test_tunnel_tcp_connect_from_added_ip() {
 /// Test multiple connections from different local IPs.
 #[tokio::test]
 async fn test_tunnel_multi_ip_connections() {
-    let ns_proc = tcp_echo_server_ns(19205).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19205).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1083,7 +1139,8 @@ async fn test_tunnel_multi_ip_connections() {
         "IP 3 should be present"
     );
 
-    let server_addr: std::net::SocketAddr = format!("{}:19205", PEER_IP).parse().unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("{}:19205", PEER_IP).parse().unwrap();
 
     // Connect from each IP and verify they all work
     for (i, ip) in [LOCAL_IP, ip2, ip3].iter().enumerate() {
@@ -1119,7 +1176,8 @@ async fn test_tunnel_multi_ip_connections() {
 async fn test_tcp_local_addr_peer_addr() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(19300).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19300).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1128,7 +1186,8 @@ async fn test_tcp_local_addr_peer_addr() {
         .await
         .expect("failed to connect to namespace");
 
-    let server_addr: std::net::SocketAddr = format!("{}:19300", PEER_IP).parse().unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("{}:19300", PEER_IP).parse().unwrap();
     let mut stream = tunnel
         .tcp_connect(server_addr)
         .await
@@ -1159,7 +1218,8 @@ async fn test_tcp_local_addr_peer_addr() {
 async fn test_udp_local_addr_ephemeral() {
     init_logging();
 
-    let ns_proc = udp_echo_server_ns(15100).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(15100).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1169,7 +1229,8 @@ async fn test_udp_local_addr_ephemeral() {
         .expect("failed to connect to namespace");
 
     // Bind to port 0 to get an ephemeral port
-    let bind_addr: std::net::SocketAddr = format!("{}:0", LOCAL_IP).parse().unwrap();
+    let bind_addr: std::net::SocketAddr =
+        format!("{}:0", LOCAL_IP).parse().unwrap();
     let socket = tunnel
         .udp_bind(bind_addr)
         .await
@@ -1186,7 +1247,8 @@ async fn test_udp_local_addr_ephemeral() {
     assert_ne!(local_addr.port(), 0, "port should not be 0");
 
     // Verify socket still works
-    let server_addr: std::net::SocketAddr = format!("{}:15100", PEER_IP).parse().unwrap();
+    let server_addr: std::net::SocketAddr =
+        format!("{}:15100", PEER_IP).parse().unwrap();
     socket
         .send_to(b"udp addr test", server_addr)
         .await
@@ -1207,7 +1269,8 @@ async fn test_udp_local_addr_ephemeral() {
 async fn test_tcp_into_split() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(19301).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19301).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1291,7 +1354,8 @@ async fn test_tcp_into_split() {
 async fn test_tcp_split_drop_behavior() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(19302).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19302).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1326,15 +1390,18 @@ async fn test_tcp_split_drop_behavior() {
 async fn test_socket_path_mode_gateway() {
     use std::path::Path;
 
-    let socket_path = format!("/tmp/tap-tunnel-test-gw-{}.sock", std::process::id());
+    let socket_path =
+        format!("/tmp/tap-tunnel-test-gw-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
-    let ns_proc = tcp_echo_server_ns(19206).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19206).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _proxy = ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
+    let _proxy =
+        ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
 
     // Wait for socket
     for _ in 0..50 {
@@ -1385,7 +1452,8 @@ async fn test_tcp_async_read_write_traits() {
 
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(19400).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19400).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1443,7 +1511,8 @@ async fn test_tcp_split_async_traits() {
 
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(19401).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19401).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1478,7 +1547,12 @@ async fn test_tcp_split_async_traits() {
         // Read until we have all 5 messages
         while all_data.len() < 80 {
             // Each message is ~18 bytes
-            match tokio::time::timeout(Duration::from_secs(2), read_half.read(&mut buf)).await {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                read_half.read(&mut buf),
+            )
+            .await
+            {
                 Ok(Ok(0)) => break, // EOF
                 Ok(Ok(n)) => all_data.extend_from_slice(&buf[..n]),
                 Ok(Err(e)) => panic!("read error: {}", e),
@@ -1514,23 +1588,30 @@ async fn test_handshake_timeout_no_response() {
     init_logging();
 
     // Create a STREAM listener that accepts connections but never responds
-    let socket_path = format!("/tmp/tap-tunnel-test-timeout-{}.sock", std::process::id());
+    let socket_path =
+        format!("/tmp/tap-tunnel-test-timeout-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
     // Spawn a thread that listens on the socket path but never writes back
     let path_clone = socket_path.clone();
     let listener_handle = std::thread::spawn(move || {
         unsafe {
-            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            let fd = libc::socket(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                0,
+            );
             assert!(fd >= 0, "socket() failed");
 
             let mut addr: libc::sockaddr_un = std::mem::zeroed();
             addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
             let path_bytes = path_clone.as_bytes();
-            addr.sun_path[..path_bytes.len()].copy_from_slice(std::slice::from_raw_parts(
-                path_bytes.as_ptr() as *const i8,
-                path_bytes.len(),
-            ));
+            addr.sun_path[..path_bytes.len()].copy_from_slice(
+                std::slice::from_raw_parts(
+                    path_bytes.as_ptr() as *const i8,
+                    path_bytes.len(),
+                ),
+            );
 
             let ret = libc::bind(
                 fd,
@@ -1543,12 +1624,17 @@ async fn test_handshake_timeout_no_response() {
             assert_eq!(ret, 0, "listen() failed");
 
             // Accept connection (reads ClientHello) but never send ProxyConfig
-            let client_fd = libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut());
+            let client_fd =
+                libc::accept(fd, std::ptr::null_mut(), std::ptr::null_mut());
             assert!(client_fd >= 0, "accept() failed");
 
             // Read ClientHello to consume it, but don't respond
             let mut buf = [0u8; 1024];
-            let _n = libc::read(client_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
+            let _n = libc::read(
+                client_fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            );
 
             // Hold connection open for a while (longer than the 5s timeout)
             std::thread::sleep(std::time::Duration::from_secs(10));
@@ -1573,7 +1659,8 @@ async fn test_handshake_timeout_no_response() {
 
     let err = result.err().expect("should fail with timeout");
     assert!(
-        err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock,
+        err.kind() == std::io::ErrorKind::TimedOut
+            || err.kind() == std::io::ErrorKind::WouldBlock,
         "error kind should be TimedOut or WouldBlock, got: {} ({:?})",
         err,
         err.kind()
@@ -1602,7 +1689,8 @@ async fn test_proxy_exit_during_handshake() {
 
     // Use a fake proxy binary that exits immediately with an error message.
     // We create a small shell script as the "proxy".
-    let fake_proxy = format!("/tmp/tap-tunnel-test-fake-proxy-{}.sh", std::process::id());
+    let fake_proxy =
+        format!("/tmp/tap-tunnel-test-fake-proxy-{}.sh", std::process::id());
     std::fs::write(
         &fake_proxy,
         "#!/bin/sh\necho 'fatal: cannot access namespace' >&2\nexit 1\n",
@@ -1643,7 +1731,8 @@ async fn test_proxy_exit_during_handshake() {
         .expect("should fail when proxy exits")
         .to_string();
     assert!(
-        err_msg.contains("proxy") || err_msg.contains("cannot access namespace"),
+        err_msg.contains("proxy")
+            || err_msg.contains("cannot access namespace"),
         "error should mention proxy failure or stderr, got: {}",
         err_msg
     );
@@ -1655,17 +1744,20 @@ async fn test_proxy_exit_during_handshake() {
 async fn test_proxy_crash_fails_pending_tcp_connect() {
     init_logging();
 
-    let socket_path = format!("/tmp/tap-tunnel-test-crash-{}.sock", std::process::id());
+    let socket_path =
+        format!("/tmp/tap-tunnel-test-crash-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
     // Create a namespace with a TCP echo server
-    let ns_proc = tcp_echo_server_ns(19500).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19500).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Start proxy in socket-path mode
-    let mut proxy = ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
+    let mut proxy =
+        ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
 
     // Wait for socket to be created
     for _ in 0..50 {
@@ -1706,8 +1798,11 @@ async fn test_proxy_crash_fails_pending_tcp_connect() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Try to TCP connect - should fail with ConnectionAborted, not hang
-    let result =
-        tokio::time::timeout(Duration::from_secs(3), tunnel.tcp_connect(server_addr)).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        tunnel.tcp_connect(server_addr),
+    )
+    .await;
 
     match result {
         Ok(Ok(_)) => panic!("tcp_connect should fail after proxy is killed"),
@@ -1722,7 +1817,9 @@ async fn test_proxy_crash_fails_pending_tcp_connect() {
             );
         }
         Err(_timeout) => {
-            panic!("tcp_connect hung after proxy was killed (should fail immediately)");
+            panic!(
+                "tcp_connect hung after proxy was killed (should fail immediately)"
+            );
         }
     }
 
@@ -1735,16 +1832,19 @@ async fn test_proxy_crash_fails_pending_tcp_connect() {
 async fn test_proxy_crash_udp_recv_does_not_hang() {
     init_logging();
 
-    let socket_path = format!("/tmp/tap-tunnel-test-udp-crash-{}.sock", std::process::id());
+    let socket_path =
+        format!("/tmp/tap-tunnel-test-udp-crash-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&socket_path);
 
     // Create a namespace
-    let ns_proc = udp_echo_server_ns(19600).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(19600).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut proxy = ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
+    let mut proxy =
+        ProxyProcess::new(pid, &socket_path).expect("failed to start proxy");
 
     for _ in 0..50 {
         if std::path::Path::new(&socket_path).exists() {
@@ -1782,7 +1882,11 @@ async fn test_proxy_crash_udp_recv_does_not_hang() {
     proxy.kill();
 
     // recv_from should not hang forever - it should either error or timeout
-    let result = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        socket.recv_from(&mut buf),
+    )
+    .await;
 
     match result {
         Ok(Ok(_)) => {}  // Unlikely but acceptable if data was buffered
@@ -1810,7 +1914,8 @@ async fn test_proxy_crash_udp_recv_does_not_hang() {
 async fn test_peer_route_cross_subnet_tcp() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(19700).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19700).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1863,7 +1968,8 @@ async fn test_peer_route_cross_subnet_tcp() {
 async fn test_peer_route_dynamic_add_remove() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(19701).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19701).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1920,7 +2026,8 @@ async fn test_peer_route_dynamic_add_remove() {
 async fn test_custom_mtu_large_udp() {
     init_logging();
 
-    let ns_proc = udp_echo_server_ns(19800).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(19800).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1952,10 +2059,13 @@ async fn test_custom_mtu_large_udp() {
 
     // Receive the echo response (server prepends "echo: ")
     let mut buf = vec![0u8; 4096];
-    let (n, from) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-        .await
-        .expect("recv_from timed out")
-        .expect("recv_from failed");
+    let (n, from) = tokio::time::timeout(
+        Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .expect("recv_from timed out")
+    .expect("recv_from failed");
     assert_eq!(from.port(), 19800);
     // "echo: " is 6 bytes
     assert_eq!(n, 3000 + 6, "response should be payload + echo prefix");
@@ -1969,7 +2079,8 @@ async fn test_custom_mtu_large_udp() {
 async fn test_custom_mtu_small_tcp() {
     init_logging();
 
-    let ns_proc = tcp_echo_server_ns(19801).expect("failed to create namespace");
+    let ns_proc =
+        tcp_echo_server_ns(19801).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2007,7 +2118,12 @@ async fn test_custom_mtu_small_tcp() {
             );
         }
         let mut buf = [0u8; 2048];
-        match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            stream.read(&mut buf),
+        )
+        .await
+        {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => received.extend_from_slice(&buf[..n]),
             Ok(Err(e)) => panic!("read error: {}", e),
@@ -2029,7 +2145,8 @@ async fn test_custom_mtu_small_tcp() {
 async fn test_udp_burst_50_packets_warm() {
     init_logging();
 
-    let ns_proc = udp_echo_server_ns(15050).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(15050).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2052,10 +2169,13 @@ async fn test_udp_burst_50_packets_warm() {
         .await
         .expect("warmup send failed");
     let mut buf = [0u8; 256];
-    let (_n, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-        .await
-        .expect("warmup recv timed out")
-        .expect("warmup recv failed");
+    let (_n, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .expect("warmup recv timed out")
+    .expect("warmup recv failed");
 
     let num_packets: usize = 50;
 
@@ -2074,7 +2194,9 @@ async fn test_udp_burst_50_packets_warm() {
 
     loop {
         let mut recv_buf = [0u8; 256];
-        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf)).await {
+        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf))
+            .await
+        {
             Ok(Ok((_n, _from))) => {
                 received += 1;
                 if received >= num_packets {
@@ -2100,7 +2222,8 @@ async fn test_udp_burst_50_packets_warm() {
 async fn test_udp_burst_50_packets_cold() {
     init_logging();
 
-    let ns_proc = udp_echo_server_ns(15051).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(15051).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2133,7 +2256,9 @@ async fn test_udp_burst_50_packets_cold() {
 
     loop {
         let mut recv_buf = [0u8; 256];
-        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf)).await {
+        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf))
+            .await
+        {
             Ok(Ok((_n, _from))) => {
                 received += 1;
                 if received >= num_packets {
@@ -2158,7 +2283,8 @@ async fn test_udp_burst_50_packets_cold() {
 async fn test_udp_burst_50_packets_under_load() {
     init_logging();
 
-    let ns_proc = udp_echo_server_ns(15052).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(15052).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2181,10 +2307,13 @@ async fn test_udp_burst_50_packets_under_load() {
         .await
         .expect("warmup send failed");
     let mut buf = [0u8; 256];
-    let _ = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-        .await
-        .expect("warmup timed out")
-        .expect("warmup failed");
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        socket.recv_from(&mut buf),
+    )
+    .await
+    .expect("warmup timed out")
+    .expect("warmup failed");
 
     // Spawn CPU-heavy background tasks to simulate load
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2221,7 +2350,9 @@ async fn test_udp_burst_50_packets_under_load() {
 
     loop {
         let mut recv_buf = [0u8; 256];
-        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf)).await {
+        match tokio::time::timeout_at(deadline, socket.recv_from(&mut recv_buf))
+            .await
+        {
             Ok(Ok((_n, _from))) => {
                 received += 1;
                 if received >= num_packets {
@@ -2271,19 +2402,22 @@ async fn test_dual_tunnel_udp_burst_50() {
         .expect("failed to connect Bob tunnel");
 
     // Bind UDP sockets
-    let alice_bind: SocketAddr = format!("{}:0", ALICE_LOCAL_IP).parse().unwrap();
+    let alice_bind: SocketAddr =
+        format!("{}:0", ALICE_LOCAL_IP).parse().unwrap();
     let alice_socket = alice_tunnel
         .udp_bind(alice_bind)
         .await
         .expect("Alice udp_bind failed");
 
-    let bob_bind: SocketAddr = format!("{}:5000", BOB_LOCAL_IP).parse().unwrap();
+    let bob_bind: SocketAddr =
+        format!("{}:5000", BOB_LOCAL_IP).parse().unwrap();
     let bob_socket = bob_tunnel
         .udp_bind(bob_bind)
         .await
         .expect("Bob udp_bind failed");
 
-    let bob_addr: SocketAddr = format!("{}:5000", BOB_LOCAL_IP).parse().unwrap();
+    let bob_addr: SocketAddr =
+        format!("{}:5000", BOB_LOCAL_IP).parse().unwrap();
     let num_packets: usize = 50;
 
     // Warm up ARP on Alice's side by sending one packet
@@ -2292,10 +2426,13 @@ async fn test_dual_tunnel_udp_burst_50() {
         .await
         .expect("warmup send failed");
     let mut buf = [0u8; 256];
-    let _ = tokio::time::timeout(Duration::from_secs(5), bob_socket.recv_from(&mut buf))
-        .await
-        .expect("warmup recv timed out")
-        .expect("warmup recv failed");
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        bob_socket.recv_from(&mut buf),
+    )
+    .await
+    .expect("warmup recv timed out")
+    .expect("warmup recv failed");
 
     // Send all packets in a burst from Alice to Bob
     for i in 0..num_packets {
@@ -2312,7 +2449,12 @@ async fn test_dual_tunnel_udp_burst_50() {
 
     loop {
         let mut recv_buf = [0u8; 256];
-        match tokio::time::timeout_at(deadline, bob_socket.recv_from(&mut recv_buf)).await {
+        match tokio::time::timeout_at(
+            deadline,
+            bob_socket.recv_from(&mut recv_buf),
+        )
+        .await
+        {
             Ok(Ok((_n, _from))) => {
                 received += 1;
                 if received >= num_packets {
@@ -2349,19 +2491,22 @@ async fn test_dual_tunnel_udp_burst_50_cold() {
         .await
         .expect("failed to connect Bob tunnel");
 
-    let alice_bind: SocketAddr = format!("{}:0", ALICE_LOCAL_IP).parse().unwrap();
+    let alice_bind: SocketAddr =
+        format!("{}:0", ALICE_LOCAL_IP).parse().unwrap();
     let alice_socket = alice_tunnel
         .udp_bind(alice_bind)
         .await
         .expect("Alice udp_bind failed");
 
-    let bob_bind: SocketAddr = format!("{}:5001", BOB_LOCAL_IP).parse().unwrap();
+    let bob_bind: SocketAddr =
+        format!("{}:5001", BOB_LOCAL_IP).parse().unwrap();
     let bob_socket = bob_tunnel
         .udp_bind(bob_bind)
         .await
         .expect("Bob udp_bind failed");
 
-    let bob_addr: SocketAddr = format!("{}:5001", BOB_LOCAL_IP).parse().unwrap();
+    let bob_addr: SocketAddr =
+        format!("{}:5001", BOB_LOCAL_IP).parse().unwrap();
     let num_packets: usize = 50;
 
     // Send all packets in a burst — NO ARP warmup
@@ -2379,7 +2524,12 @@ async fn test_dual_tunnel_udp_burst_50_cold() {
 
     loop {
         let mut recv_buf = [0u8; 256];
-        match tokio::time::timeout_at(deadline, bob_socket.recv_from(&mut recv_buf)).await {
+        match tokio::time::timeout_at(
+            deadline,
+            bob_socket.recv_from(&mut recv_buf),
+        )
+        .await
+        {
             Ok(Ok((_n, _from))) => {
                 received += 1;
                 if received >= num_packets {
@@ -2403,7 +2553,8 @@ async fn test_dual_tunnel_udp_burst_50_cold() {
 async fn test_get_iface_stats() {
     init_logging();
 
-    let ns_proc = udp_echo_server_ns(19800).expect("failed to create namespace");
+    let ns_proc =
+        udp_echo_server_ns(19800).expect("failed to create namespace");
     let pid = ns_proc.pid();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2424,10 +2575,11 @@ async fn test_get_iface_stats() {
         .expect("send failed");
 
     let mut buf = [0u8; 64];
-    let (n, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
-        .await
-        .expect("timeout waiting for response")
-        .expect("recv_from failed");
+    let (n, _) =
+        tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for response")
+            .expect("recv_from failed");
     assert!(n > 0, "should receive a response");
 
     // Now query the interface stats
@@ -2463,7 +2615,8 @@ async fn test_get_iface_stats() {
 async fn test_connect_to_nonexistent_path() {
     init_logging();
 
-    let result = Tunnel::connect_to("/tmp/tap-tunnel-nonexistent.sock", None).await;
+    let result =
+        Tunnel::connect_to("/tmp/tap-tunnel-nonexistent.sock", None).await;
     let err = result.err().expect("should fail for nonexistent path");
     assert!(
         err.kind() == std::io::ErrorKind::NotFound

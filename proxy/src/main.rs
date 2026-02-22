@@ -32,12 +32,13 @@ mod tap;
 
 use ipc::{accept_stream, create_stream_listener};
 use namespace::join_namespace;
+use std::collections::HashMap;
 use tap::{configure_interface, create_tap};
 use tap_tunnel::TapConfig;
-use std::collections::HashMap;
 use tap_tunnel::protocol::{
-    ClientHello, InterfaceStats, Message, ProxyCommand, ProxyConfig, ProxyResponse,
-    decode_control, decode_message, encode_control, encode_frame,
+    ClientHello, InterfaceStats, Message, ProxyCommand, ProxyConfig,
+    ProxyResponse, decode_control, decode_message, encode_control,
+    encode_frame,
 };
 
 /// Ethernet header size in bytes.
@@ -126,6 +127,8 @@ fn main() {
     if let Err(e) = result {
         error!("proxy error: {}", e);
         std::process::exit(1);
+    } else {
+        debug!("proxy exit");
     }
 }
 
@@ -185,7 +188,8 @@ fn run(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
     } else {
         None
     };
-    let tap_mac = configure_interface(&config.interface_name, config.peer_addr, mtu_opt)?;
+    let tap_mac =
+        configure_interface(&config.interface_name, config.peer_addr, mtu_opt)?;
     if let Some((ip, prefix_len)) = config.peer_addr {
         debug!("configured IP: {}/{}", ip, prefix_len);
     }
@@ -208,7 +212,10 @@ fn run(frame_fd: OwnedFd, config: TapConfig) -> io::Result<()> {
 }
 
 /// Run in socket-path mode: bind, listen, accept a connection, then run proxy with handshake.
-fn run_socket_path_mode(socket_path: &std::path::Path, config: TapConfig) -> io::Result<()> {
+fn run_socket_path_mode(
+    socket_path: &std::path::Path,
+    config: TapConfig,
+) -> io::Result<()> {
     debug!("binding to socket path: {:?}", socket_path);
     let listener = create_stream_listener(socket_path)?;
     debug!("listening for connection on {:?}", socket_path);
@@ -233,10 +240,21 @@ fn read_exact_fd(fd: i32, buf: &mut [u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < buf.len() {
         let ret = unsafe {
-            libc::read(fd, buf[offset..].as_mut_ptr() as *mut libc::c_void, buf.len() - offset)
+            libc::read(
+                fd,
+                buf[offset..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - offset,
+            )
         };
-        if ret < 0 { return Err(io::Error::last_os_error()); }
-        if ret == 0 { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed")); }
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            ));
+        }
         offset += ret as usize;
     }
     Ok(())
@@ -247,15 +265,25 @@ fn write_all_fd(fd: i32, buf: &[u8]) -> io::Result<()> {
     let mut offset = 0;
     while offset < buf.len() {
         let ret = unsafe {
-            libc::write(fd, buf[offset..].as_ptr() as *const libc::c_void, buf.len() - offset)
+            libc::write(
+                fd,
+                buf[offset..].as_ptr() as *const libc::c_void,
+                buf.len() - offset,
+            )
         };
-        if ret < 0 { return Err(io::Error::last_os_error()); }
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
         offset += ret as usize;
     }
     Ok(())
 }
 
-fn perform_handshake(fd: &OwnedFd, config: &TapConfig, tap_mac: [u8; 6]) -> io::Result<()> {
+fn perform_handshake(
+    fd: &OwnedFd,
+    config: &TapConfig,
+    tap_mac: [u8; 6],
+) -> io::Result<()> {
     let raw_fd = fd.as_raw_fd();
 
     // Receive ClientHello with length-prefix framing
@@ -279,7 +307,10 @@ fn perform_handshake(fd: &OwnedFd, config: &TapConfig, tap_mac: [u8; 6]) -> io::
 
     // Get TAP config
     let (tap_ip, prefix_len) = config.peer_addr.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "tap_addr must be configured")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tap_addr must be configured",
+        )
     })?;
 
     // Send ProxyConfig with proxy identity (length-prefix framed)
@@ -302,7 +333,11 @@ fn perform_handshake(fd: &OwnedFd, config: &TapConfig, tap_mac: [u8; 6]) -> io::
 ///
 /// This announces the IP/MAC mapping to pre-fill the peer's ARP cache
 /// and signals that the proxy is ready.
-fn build_gratuitous_arp(sender_mac: [u8; 6], sender_ip: Ipv4Addr, target_mac: [u8; 6]) -> Vec<u8> {
+fn build_gratuitous_arp(
+    sender_mac: [u8; 6],
+    sender_ip: Ipv4Addr,
+    target_mac: [u8; 6],
+) -> Vec<u8> {
     let mut frame = Vec::with_capacity(42);
 
     // Ethernet header (14 bytes)
@@ -345,7 +380,9 @@ impl AsyncFdIo {
         if flags < 0 {
             return Err(io::Error::last_os_error());
         }
-        let ret = unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        let ret = unsafe {
+            libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK)
+        };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -365,7 +402,9 @@ impl AsyncRead for AsyncFdIo {
         loop {
             let mut guard = match self.inner.poll_read_ready(cx) {
                 std::task::Poll::Ready(Ok(guard)) => guard,
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(e));
+                }
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             };
 
@@ -406,15 +445,22 @@ impl AsyncWrite for AsyncFdIo {
         loop {
             let mut guard = match self.inner.poll_write_ready(cx) {
                 std::task::Poll::Ready(Ok(guard)) => guard,
-                std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
+                std::task::Poll::Ready(Err(e)) => {
+                    return std::task::Poll::Ready(Err(e));
+                }
                 std::task::Poll::Pending => return std::task::Poll::Pending,
             };
 
             let fd = self.inner.get_ref().as_raw_fd();
 
             match guard.try_io(|_| {
-                let ret =
-                    unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+                let ret = unsafe {
+                    libc::write(
+                        fd,
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                    )
+                };
                 if ret < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -454,7 +500,9 @@ async fn run_proxy(
     debug!("TAP proxy starting");
 
     // Wrap STREAM socket as tokio UnixStream for efficient async I/O
-    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(frame_fd.into_raw_fd()) };
+    let std_stream = unsafe {
+        std::os::unix::net::UnixStream::from_raw_fd(frame_fd.into_raw_fd())
+    };
     std_stream.set_nonblocking(true)?;
     let ipc_stream = tokio::net::UnixStream::from_std(std_stream)?;
     let (ipc_read, mut ipc_write) = ipc_stream.into_split();
@@ -474,15 +522,32 @@ async fn run_proxy(
     }
 
     // Set up rtnetlink connection for route management
-    let (rt_conn, rt_handle, _) = rtnetlink::new_connection()
-        .map_err(|e| io::Error::other(format!("failed to create rtnetlink connection: {}", e)))?;
+    let (rt_conn, rt_handle, _) = rtnetlink::new_connection().map_err(|e| {
+        io::Error::other(format!(
+            "failed to create rtnetlink connection: {}",
+            e
+        ))
+    })?;
     tokio::spawn(rt_conn);
 
     // Add initial routes from CLI args
     for (dest, prefix_len) in &config.peer_routes {
-        match route::add_route(&rt_handle, &config.interface_name, *dest, *prefix_len).await {
-            Ok(()) => debug!("added initial route {}/{} dev {}", dest, prefix_len, config.interface_name),
-            Err(e) => error!("failed to add initial route {}/{}: {}", dest, prefix_len, e),
+        match route::add_route(
+            &rt_handle,
+            &config.interface_name,
+            *dest,
+            *prefix_len,
+        )
+        .await
+        {
+            Ok(()) => debug!(
+                "added initial route {}/{} dev {}",
+                dest, prefix_len, config.interface_name
+            ),
+            Err(e) => error!(
+                "failed to add initial route {}/{}: {}",
+                dest, prefix_len, e
+            ),
         }
     }
 
@@ -493,7 +558,15 @@ async fn run_proxy(
     let max_frame_size = config.mtu as usize + ETHERNET_HEADER_SIZE;
 
     // Run frame relay loop with protocol support
-    run_frame_relay(tap, ipc_read, ipc_write, &rt_handle, &config.interface_name, max_frame_size).await
+    run_frame_relay(
+        tap,
+        ipc_read,
+        ipc_write,
+        &rt_handle,
+        &config.interface_name,
+        max_frame_size,
+    )
+    .await
 }
 
 /// Handle a proxy command and return a response.
@@ -507,7 +580,14 @@ async fn handle_proxy_command(
             id,
             destination,
             prefix_len,
-        } => match route::add_route(rt_handle, iface_name, destination, prefix_len).await {
+        } => match route::add_route(
+            rt_handle,
+            iface_name,
+            destination,
+            prefix_len,
+        )
+        .await
+        {
             Ok(()) => {
                 debug!(
                     "[PROXY] added route {}/{} dev {}",
@@ -527,7 +607,14 @@ async fn handle_proxy_command(
             id,
             destination,
             prefix_len,
-        } => match route::remove_route(rt_handle, iface_name, destination, prefix_len).await {
+        } => match route::remove_route(
+            rt_handle,
+            iface_name,
+            destination,
+            prefix_len,
+        )
+        .await
+        {
             Ok(()) => {
                 debug!(
                     "[PROXY] removed route {}/{} dev {}",
@@ -545,7 +632,10 @@ async fn handle_proxy_command(
         },
         ProxyCommand::GetIfaceStats { id } => match read_proc_net_dev() {
             Ok(interfaces) => {
-                debug!("[PROXY] returning interface stats ({} interfaces)", interfaces.len());
+                debug!(
+                    "[PROXY] returning interface stats ({} interfaces)",
+                    interfaces.len()
+                );
                 ProxyResponse::IfaceStats { id, interfaces }
             }
             Err(e) => {
@@ -621,15 +711,18 @@ async fn run_frame_relay(
     let mut tap_writer = AsyncFdIo::new(tap_write_fd)?;
 
     // Wrap IPC socket halves in buffered I/O for batched reads/writes
-    let mut ipc_reader = tokio::io::BufReader::with_capacity(PROXY_IPC_BUFFER_SIZE, ipc_read);
-    let ipc_writer = tokio::io::BufWriter::with_capacity(PROXY_IPC_BUFFER_SIZE, ipc_write);
+    let mut ipc_reader =
+        tokio::io::BufReader::with_capacity(PROXY_IPC_BUFFER_SIZE, ipc_read);
+    let ipc_writer =
+        tokio::io::BufWriter::with_capacity(PROXY_IPC_BUFFER_SIZE, ipc_write);
 
     // Channel between TAP reader and IPC writer — decouples TAP reads from IPC writes
     let (tap_frame_tx, mut tap_frame_rx) =
         tokio::sync::mpsc::channel::<Vec<u8>>(PROXY_FRAME_CHANNEL_CAPACITY);
 
     // Channel for control responses from ipc_to_tap back to the socket writer
-    let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let (response_tx, mut response_rx) =
+        tokio::sync::mpsc::channel::<Vec<u8>>(8);
 
     debug!("[PROXY] frame relay starting (stream mode)");
 
@@ -658,7 +751,10 @@ async fn run_frame_relay(
                     tokio::sync::mpsc::error::TrySendError::Full(_) => {
                         dropped += 1;
                         if dropped % 1000 == 1 {
-                            debug!("[PROXY] TAP→IPC channel full, dropped {} frames", dropped);
+                            debug!(
+                                "[PROXY] TAP→IPC channel full, dropped {} frames",
+                                dropped
+                            );
                         }
                     }
                     tokio::sync::mpsc::error::TrySendError::Closed(_) => {
@@ -734,7 +830,11 @@ async fn run_frame_relay(
             }
 
             // Read message body
-            if ipc_reader.read_exact(&mut msg_buf[..msg_len]).await.is_err() {
+            if ipc_reader
+                .read_exact(&mut msg_buf[..msg_len])
+                .await
+                .is_err()
+            {
                 debug!("[PROXY] parent closed during message read");
                 return Ok(());
             }
@@ -747,14 +847,22 @@ async fn run_frame_relay(
                 Ok(Message::Control(payload)) => {
                     match decode_control::<ProxyCommand>(&payload) {
                         Ok(cmd) => {
-                            let response = handle_proxy_command(cmd, &rt_handle, &iface_name).await;
+                            let response = handle_proxy_command(
+                                cmd,
+                                &rt_handle,
+                                &iface_name,
+                            )
+                            .await;
                             let response_msg = encode_control(&response)
                                 .expect("failed to encode ProxyResponse");
                             // Send response via channel to socket writer task
                             let _ = response_tx.send(response_msg).await;
                         }
                         Err(e) => {
-                            debug!("[PROXY] failed to decode control message: {}", e);
+                            debug!(
+                                "[PROXY] failed to decode control message: {}",
+                                e
+                            );
                         }
                     }
                 }

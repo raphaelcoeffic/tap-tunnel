@@ -386,14 +386,14 @@ fn find_proxy_binary() -> io::Result<std::path::PathBuf> {
         && let Some(exe_dir) = exe_path.parent()
     {
         let proxy_path = exe_dir.join(PROXY_NAME);
-        if proxy_path.exists() {
+        if proxy_path.try_exists()? {
             return Ok(proxy_path);
         }
 
         // Also check parent directories for cargo target structure
         if let Some(parent) = exe_dir.parent() {
             let proxy_path = parent.join(PROXY_NAME);
-            if proxy_path.exists() {
+            if proxy_path.try_exists()? {
                 return Ok(proxy_path);
             }
         }
@@ -402,7 +402,7 @@ fn find_proxy_binary() -> io::Result<std::path::PathBuf> {
     // 2. Check TAP_TUNNEL_PROXY environment variable
     if let Ok(proxy_path) = std::env::var("TAP_TUNNEL_PROXY") {
         let path = std::path::PathBuf::from(&proxy_path);
-        if path.exists() {
+        if path.try_exists()? {
             return Ok(path);
         }
     }
@@ -413,7 +413,7 @@ fn find_proxy_binary() -> io::Result<std::path::PathBuf> {
             .join("target")
             .join("debug")
             .join(PROXY_NAME);
-        if target_debug.exists() {
+        if target_debug.try_exists()? {
             return Ok(target_debug);
         }
 
@@ -421,7 +421,7 @@ fn find_proxy_binary() -> io::Result<std::path::PathBuf> {
             .join("target")
             .join("release")
             .join(PROXY_NAME);
-        if target_release.exists() {
+        if target_release.try_exists()? {
             return Ok(target_release);
         }
     }
@@ -434,7 +434,7 @@ fn find_proxy_binary() -> io::Result<std::path::PathBuf> {
     {
         let path_str = String::from_utf8_lossy(&output.stdout);
         let path = std::path::PathBuf::from(path_str.trim());
-        if path.exists() {
+        if path.try_exists()? {
             return Ok(path);
         }
     }

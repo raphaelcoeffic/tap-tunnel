@@ -73,7 +73,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, Sender};
@@ -356,6 +356,8 @@ struct TunnelInner {
     local_addr: IpWithPrefix,
     /// Whether close() has been called
     closed: Arc<AtomicBool>,
+    /// Flag shared with IPC/stack tasks — set to signal shutdown
+    ipc_dead: Arc<AtomicBool>,
     /// Atomic counter for proxy command request IDs
     next_request_id: AtomicU64,
     /// Map of pending proxy command responses
@@ -374,6 +376,10 @@ impl TunnelInner {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        // Signal the stack task to exit its poll loop.  This must happen
+        // before aborting tasks so the stack sees the flag even if it is
+        // in the middle of a poll cycle and the abort is deferred.
+        self.ipc_dead.store(true, Ordering::SeqCst);
         if let Ok(mut guard) = self.proxy_child.lock() {
             if let Some(ref mut child) = *guard {
                 let _ = child.kill();
@@ -837,10 +843,12 @@ impl Tunnel {
         // Wrap in BufReader/BufWriter for batched I/O (reduces syscalls dramatically)
         const LIB_IPC_BUFFER_SIZE: usize = 256 * 1024;
 
-        // Shared flag: set by IPC tasks when proxy connection is lost
+        // Shared flag: set by IPC tasks when proxy connection is lost,
+        // and by close() to signal the stack task to exit.
         let ipc_dead = Arc::new(AtomicBool::new(false));
         let ipc_dead_reader = Arc::clone(&ipc_dead);
         let ipc_dead_writer = Arc::clone(&ipc_dead);
+        let ipc_dead_inner = Arc::clone(&ipc_dead);
 
         // Closed flag
         let closed = Arc::new(AtomicBool::new(false));
@@ -1063,6 +1071,7 @@ impl Tunnel {
                 gateway,
                 local_addr: (local_ip, local_prefix),
                 closed,
+                ipc_dead: ipc_dead_inner,
                 next_request_id: AtomicU64::new(1),
                 pending_proxy_responses,
                 stats,
